@@ -144,6 +144,54 @@ class StateManager:
 
 
 # ============================================================
+# pytest出力パーサー（pure function — テスト可能）
+# ============================================================
+
+def parse_pytest_result(output: str, exit_code: int) -> dict[str, Any]:
+    """pytest出力とexit_codeからスキャン結果dictを生成する。
+
+    Pure function。subprocess を呼ばずにユニットテスト可能。
+
+    Args:
+        output: stdout + stderr の結合文字列
+        exit_code: プロセスの returncode
+
+    Returns:
+        dict with keys: available, failures, exit_code, summary, tail
+    """
+    lines = output.strip().splitlines() if output.strip() else []
+    summary = lines[-1] if lines else ""
+    tail = lines[-20:] if lines else []  # デバッグ用に末尾20行
+
+    # "N failed" パターンをパース
+    failures = 0
+    for line in lines:
+        if "failed" in line:
+            parts = line.split()
+            for i, p in enumerate(parts):
+                if p in ("failed", "failed,"):
+                    try:
+                        failures = int(parts[i - 1])
+                    except (ValueError, IndexError):
+                        pass
+                    break
+            if failures > 0:
+                break
+
+    # exit_code!=0 なのに failures==0 → 収集エラー等。最低1を保証
+    if exit_code not in (0, None) and exit_code != -1 and failures == 0:
+        failures = 1
+
+    return {
+        "available": True,
+        "failures": failures,
+        "exit_code": exit_code,
+        "summary": summary,
+        "tail": tail,
+    }
+
+
+# ============================================================
 # Scanner — workflow_lint / pytest 実行
 # ============================================================
 
@@ -187,27 +235,10 @@ class Scanner:
                 capture_output=True, text=True, timeout=120,
                 cwd=str(self.workspace),
             )
-            # 失敗数をパース（例: "3 failed, 10 passed"）
             output = result.stdout + result.stderr
-            failures = 0
-            for line in output.splitlines():
-                if "failed" in line:
-                    parts = line.split()
-                    for i, p in enumerate(parts):
-                        if p == "failed" or p == "failed,":
-                            try:
-                                failures = int(parts[i - 1])
-                            except (ValueError, IndexError):
-                                pass
-                            break
-            return {
-                "available": True,
-                "failures": failures,
-                "exit_code": result.returncode,
-                "summary": output.strip().splitlines()[-1] if output.strip() else "",
-            }
+            return parse_pytest_result(output, result.returncode)
         except (subprocess.TimeoutExpired, OSError) as e:
-            return {"available": True, "failures": -1, "error": str(e)}
+            return {"available": True, "failures": -1, "exit_code": -1, "error": str(e), "tail": []}
 
 
 # ============================================================
@@ -228,14 +259,27 @@ def generate_candidates(scan_results: dict[str, Any]) -> list[dict[str, Any]]:
             "description": finding,
             "estimated_effort": "low",
         })
-    # pytest の失敗 → 優先度2
+    # pytest の失敗 / 異常終了 → 優先度2
     pytest_data = scan_results.get("pytest", {})
-    if pytest_data.get("failures", 0) > 0:
+    pytest_exit = pytest_data.get("exit_code", 0)
+    pytest_failures = pytest_data.get("failures", 0)
+    if pytest_failures > 0:
+        # パースで失敗数が取れた場合
         candidates.append({
-            "task_id": "pytest_failures",
+            "task_id": f"pytest_exit_{pytest_exit}",
             "source": "pytest",
             "priority": 2,
-            "title": f"テスト失敗修正 ({pytest_data['failures']}件)",
+            "title": f"テスト失敗修正 ({pytest_failures}件)",
+            "description": pytest_data.get("summary", ""),
+            "estimated_effort": "medium",
+        })
+    elif pytest_exit not in (0, None) and pytest_exit != -1:
+        # exit_code!=0 だが failures パースできなかった場合（収集エラー等）
+        candidates.append({
+            "task_id": f"pytest_exit_{pytest_exit}",
+            "source": "pytest",
+            "priority": 2,
+            "title": f"pytest異常終了 (exit_code={pytest_exit})",
             "description": pytest_data.get("summary", ""),
             "estimated_effort": "medium",
         })
@@ -364,8 +408,24 @@ def run_cycle(args: argparse.Namespace) -> int:
         state["completed_at"] = datetime.now(JST).isoformat()
         state["phase"] = "CHECKPOINT"
         sm.save(state)
+        # 候補なし早期終了でも report.json を出力
+        report = {
+            "cycle_id": state["cycle_id"],
+            "status": state["status"],
+            "reason": "no_candidates",
+            "scan_summary": {
+                "lint_errors": state["scan_results"].get("workflow_lint_errors", 0),
+                "pytest_failures": state["scan_results"].get("pytest_failures", 0),
+            },
+            "candidates_count": 0,
+            "selected_task": None,
+            "outcome": "SUCCESS",
+            "paused_tasks": state.get("paused_tasks", []),
+        }
+        report_path = sm.save_report(report, date_str)
         _record_ki("SUCCESS", cycle_id=state["cycle_id"], task_id="none", note="no_candidates")
         print(f"[CHECKPOINT] state保存完了: {sm.state_path}")
+        print(f"[CHECKPOINT] レポート出力: {report_path}")
         return 0
     print(f"[SELECT] タスク選択: {selected['task_id']} — {selected['title']}")
 

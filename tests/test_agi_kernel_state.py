@@ -22,6 +22,7 @@ from agi_kernel import (
     generate_candidates,
     select_task,
     record_failure,
+    parse_pytest_result,
     MAX_TASK_FAILURES,
 )
 
@@ -221,3 +222,91 @@ class TestCandidateSelection:
     def test_select_none_when_empty(self):
         selected = select_task([], paused_tasks=[])
         assert selected is None
+
+    def test_generate_candidates_pytest_exit2_no_failed_line(self):
+        """exit_code=2 で 'failed' 行なし → 候補が出ることを確認。"""
+        scan = {
+            "workflow_lint": {"errors": 0, "findings": []},
+            "pytest": {"failures": 1, "exit_code": 2, "summary": "ERROR collecting"},
+        }
+        candidates = generate_candidates(scan)
+        assert len(candidates) >= 1
+        pytest_cand = [c for c in candidates if c["source"] == "pytest"]
+        assert len(pytest_cand) == 1
+        assert pytest_cand[0]["task_id"] == "pytest_exit_2"
+
+    def test_generate_candidates_pytest_exit0_no_candidate(self):
+        """exit_code=0 かつ failures=0 → pytest候補なし。"""
+        scan = {
+            "workflow_lint": {"errors": 0, "findings": []},
+            "pytest": {"failures": 0, "exit_code": 0},
+        }
+        candidates = generate_candidates(scan)
+        pytest_cand = [c for c in candidates if c["source"] == "pytest"]
+        assert len(pytest_cand) == 0
+
+    def test_generate_candidates_pytest_exit1_with_failures(self):
+        """exit_code=1, failures=3 → 安定IDが pytest_exit_1。"""
+        scan = {
+            "workflow_lint": {"errors": 0, "findings": []},
+            "pytest": {"failures": 3, "exit_code": 1, "summary": "3 failed, 10 passed"},
+        }
+        candidates = generate_candidates(scan)
+        pytest_cand = [c for c in candidates if c["source"] == "pytest"]
+        assert len(pytest_cand) == 1
+        assert pytest_cand[0]["task_id"] == "pytest_exit_1"
+
+
+# ────────────────────────────────────────
+# parse_pytest_result テスト
+# ────────────────────────────────────────
+
+class TestParsePytestResult:
+    """pytest出力パーサーのユニットテスト。"""
+
+    def test_normal_3_failed(self):
+        """'3 failed, 10 passed' → failures=3。"""
+        output = "FAILED tests/test_a.py\nFAILED tests/test_b.py\n3 failed, 10 passed"
+        result = parse_pytest_result(output, exit_code=1)
+        assert result["failures"] == 3
+        assert result["exit_code"] == 1
+        assert result["available"] is True
+
+    def test_exit2_no_failed_line(self):
+        """exit_code=2 で 'failed' 行なし → failures>=1（収集エラー）。"""
+        output = "ERROR collecting tests/test_broken.py\n1 error"
+        result = parse_pytest_result(output, exit_code=2)
+        assert result["failures"] >= 1
+        assert result["exit_code"] == 2
+
+    def test_exit0_all_pass(self):
+        """exit_code=0 → failures=0。"""
+        output = "20 passed in 0.15s"
+        result = parse_pytest_result(output, exit_code=0)
+        assert result["failures"] == 0
+        assert result["exit_code"] == 0
+
+    def test_empty_output_exit1(self):
+        """空出力でexit_code=1 → failures>=1。"""
+        result = parse_pytest_result("", exit_code=1)
+        assert result["failures"] >= 1
+
+    def test_tail_included(self):
+        """出力末尾がtailに含まれる。"""
+        lines = [f"line {i}" for i in range(30)]
+        output = "\n".join(lines)
+        result = parse_pytest_result(output, exit_code=0)
+        assert len(result["tail"]) == 20
+        assert result["tail"][-1] == "line 29"
+
+    def test_summary_is_last_line(self):
+        """summaryは最終行。"""
+        output = "collecting...\n20 passed in 0.5s"
+        result = parse_pytest_result(output, exit_code=0)
+        assert result["summary"] == "20 passed in 0.5s"
+
+    def test_exit_minus1_treated_as_error(self):
+        """exit_code=-1 はタイムアウト等の特殊値。failures補正しない。"""
+        result = parse_pytest_result("", exit_code=-1)
+        assert result["failures"] == 0  # -1は補正対象外
+
