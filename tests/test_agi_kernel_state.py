@@ -15,8 +15,29 @@ from pathlib import Path
 import pytest
 
 # テスト対象モジュールをインポートできるようにパスを追加
+# 固定パスに依存せず、rglob で agi_kernel.py を自動発見する
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_SCRIPT_DIR = _REPO_ROOT / "エージェント" / "AGIカーネル" / "scripts"
+_EXCLUDE_DIRS = {"_outputs", ".venv", "venv", "node_modules", "__pycache__", ".git"}
+
+
+def _find_agi_kernel_script() -> Path:
+    """リポジトリ内の agi_kernel.py を自動発見する。"""
+    for p in _REPO_ROOT.rglob("agi_kernel.py"):
+        # 除外ディレクトリをスキップ
+        if any(part in _EXCLUDE_DIRS for part in p.parts):
+            continue
+        # scripts/ 配下のものを採用
+        if p.parent.name == "scripts":
+            return p
+    raise FileNotFoundError(
+        f"agi_kernel.py が見つかりません。\n"
+        f"検索ルート: {_REPO_ROOT}\n"
+        f"'scripts/' 配下に agi_kernel.py を配置してください。"
+    )
+
+
+_SCRIPT_PATH = _find_agi_kernel_script()
+_SCRIPT_DIR = _SCRIPT_PATH.parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
