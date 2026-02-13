@@ -12,6 +12,7 @@ AGI Kernel — 自己改善ループ MVP
 """
 
 from __future__ import annotations
+import re
 
 __version__ = "0.2.0"
 
@@ -258,6 +259,58 @@ class StateManager:
 # pytest出力パーサー（pure function — テスト可能）
 # ============================================================
 
+# errors_count 抽出用パターン
+_RE_ERRORS_IN = re.compile(r"(?:^|\s)(\d+)\s+errors?\s+in\s", re.MULTILINE)
+_RE_INTERRUPTED = re.compile(r"Interrupted:\s+(\d+)\s+errors?\s+during\s+collection")
+
+# headline 候補抽出用キーワード
+_EXCEPTION_NAMES = (
+    "ModuleNotFoundError", "ImportError", "ConnectionRefusedError",
+    "FileNotFoundError", "SyntaxError", "AttributeError",
+    "TypeError", "NameError", "OSError", "PermissionError",
+)
+
+
+def _extract_headline(lines: list[str]) -> str:
+    """出力行からエラー原因を示す最適な1行を抽出する。"""
+    # 優先度1: "ERROR collecting" を含む行
+    for line in lines:
+        if "ERROR collecting" in line:
+            return line.strip()
+
+    # 優先度2: 行頭が "E   " の例外行（pytestの詳細出力）
+    for line in lines:
+        stripped = line.rstrip()
+        if stripped.startswith("E   "):
+            return stripped
+
+    # 優先度3: 既知の例外名を含む行
+    for line in lines:
+        for exc in _EXCEPTION_NAMES:
+            if exc in line:
+                return line.strip()
+
+    # 優先度4: "Interrupted: N errors during collection"
+    for line in lines:
+        if "Interrupted:" in line and "errors" in line:
+            return line.strip()
+
+    # フォールバック: 末尾行
+    return lines[-1].strip() if lines else ""
+
+
+def _extract_error_lines(lines: list[str], max_lines: int = 10) -> list[str]:
+    """'ERROR' で始まる行を最大N行抽出する。"""
+    result = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("ERROR") or stripped.startswith("E   "):
+            result.append(stripped)
+            if len(result) >= max_lines:
+                break
+    return result
+
+
 def parse_pytest_result(output: str, exit_code: int) -> dict[str, Any]:
     """pytest出力とexit_codeからスキャン結果dictを生成する。
 
@@ -268,7 +321,9 @@ def parse_pytest_result(output: str, exit_code: int) -> dict[str, Any]:
         exit_code: プロセスの returncode
 
     Returns:
-        dict with keys: available, failures, exit_code, summary, tail
+        dict with keys:
+            available, failures, exit_code, summary, tail（後方互換）
+            headline, errors_count, error_lines（v0.2.1追加）
     """
     lines = output.strip().splitlines() if output.strip() else []
     summary = lines[-1] if lines else ""
@@ -289,9 +344,26 @@ def parse_pytest_result(output: str, exit_code: int) -> dict[str, Any]:
             if failures > 0:
                 break
 
+    # errors_count: "N errors in ..." または "Interrupted: N errors"
+    errors_count = 0
+    full_text = output if output else ""
+    m = _RE_ERRORS_IN.search(full_text)
+    if m:
+        errors_count = int(m.group(1))
+    else:
+        m = _RE_INTERRUPTED.search(full_text)
+        if m:
+            errors_count = int(m.group(1))
+
     # exit_code!=0 なのに failures==0 → 収集エラー等。最低1を保証
     if exit_code not in (0, None) and exit_code != -1 and failures == 0:
         failures = 1
+
+    # headline: エラー原因が分かる1行
+    headline = _extract_headline(lines) if lines else ""
+
+    # error_lines: ERROR/E行を最大10行
+    error_lines = _extract_error_lines(lines)
 
     return {
         "available": True,
@@ -299,6 +371,10 @@ def parse_pytest_result(output: str, exit_code: int) -> dict[str, Any]:
         "exit_code": exit_code,
         "summary": summary,
         "tail": tail,
+        # v0.2.1 追加
+        "headline": headline,
+        "errors_count": errors_count,
+        "error_lines": error_lines,
     }
 
 
@@ -356,6 +432,20 @@ class Scanner:
 # タスク候補生成・選択
 # ============================================================
 
+def _build_pytest_description(pytest_data: dict[str, Any]) -> str:
+    """pytest候補のdescriptionを構築する。headline + error_lines。"""
+    headline = pytest_data.get("headline", "") or pytest_data.get("summary", "")
+    error_lines = pytest_data.get("error_lines", [])
+
+    parts = [headline]
+    if error_lines:
+        parts.append("")
+        parts.extend(error_lines[:5])  # 最大5行
+
+    desc = "\n".join(parts)
+    return desc[:800]  # 長すぎ防止
+
+
 def generate_candidates(scan_results: dict[str, Any]) -> list[dict[str, Any]]:
     """スキャン結果からタスク候補を生成する。"""
     candidates = []
@@ -374,24 +464,31 @@ def generate_candidates(scan_results: dict[str, Any]) -> list[dict[str, Any]]:
     pytest_data = scan_results.get("pytest", {})
     pytest_exit = pytest_data.get("exit_code", 0)
     pytest_failures = pytest_data.get("failures", 0)
+    errors_count = pytest_data.get("errors_count", 0)
+    description = _build_pytest_description(pytest_data)
+
     if pytest_failures > 0:
-        # パースで失敗数が取れた場合
+        # タイトル: errors_count があればそちらを優先表示
+        if errors_count > 0:
+            title = f"収集エラー修正 ({errors_count}件)"
+        else:
+            title = f"テスト失敗修正 ({pytest_failures}件)"
         candidates.append({
             "task_id": f"pytest_exit_{pytest_exit}",
             "source": "pytest",
             "priority": 2,
-            "title": f"テスト失敗修正 ({pytest_failures}件)",
-            "description": pytest_data.get("summary", ""),
+            "title": title,
+            "description": description,
             "estimated_effort": "medium",
         })
     elif pytest_exit not in (0, None) and pytest_exit != -1:
-        # exit_code!=0 だが failures パースできなかった場合（収集エラー等）
+        title = f"pytest異常終了 (exit_code={pytest_exit})"
         candidates.append({
             "task_id": f"pytest_exit_{pytest_exit}",
             "source": "pytest",
             "priority": 2,
-            "title": f"pytest異常終了 (exit_code={pytest_exit})",
-            "description": pytest_data.get("summary", ""),
+            "title": title,
+            "description": description,
             "estimated_effort": "medium",
         })
     return candidates

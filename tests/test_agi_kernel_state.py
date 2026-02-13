@@ -457,3 +457,164 @@ class TestParsePytestResult:
         """exit_code=-1 はタイムアウト等の特殊値。failures補正しない。"""
         result = parse_pytest_result("", exit_code=-1)
         assert result["failures"] == 0  # -1は補正対象外
+
+    # ── v0.2.1: headline / errors_count / error_lines テスト ──
+
+    def test_headline_error_collecting(self):
+        """'ERROR collecting' 行が headline になる。"""
+        output = (
+            "WARNING: something irrelevant\n"
+            "ERROR collecting tests/test_broken.py\n"
+            "E   ModuleNotFoundError: No module named 'foo'\n"
+            "9 errors in 7.88s"
+        )
+        result = parse_pytest_result(output, exit_code=2)
+        assert "ERROR collecting" in result["headline"]
+
+    def test_headline_e_line_when_no_collecting(self):
+        """'ERROR collecting' がない場合、'E   ' 行が headline になる。"""
+        output = (
+            "FAILED tests/test_a.py::test_x\n"
+            "E   AssertionError: expected 1 got 2\n"
+            "1 failed, 5 passed"
+        )
+        result = parse_pytest_result(output, exit_code=1)
+        assert result["headline"].startswith("E   ")
+
+    def test_headline_exception_name(self):
+        """例外名を含む行が headline になる。"""
+        output = (
+            "collecting...\n"
+            "ModuleNotFoundError: No module named 'broken_module'\n"
+            "2 errors in 1.0s"
+        )
+        result = parse_pytest_result(output, exit_code=2)
+        assert "ModuleNotFoundError" in result["headline"]
+
+    def test_headline_fallback_to_last_line(self):
+        """何も該当しなければ末尾行。"""
+        output = "20 passed in 0.5s"
+        result = parse_pytest_result(output, exit_code=0)
+        assert result["headline"] == "20 passed in 0.5s"
+
+    def test_headline_not_warning(self):
+        """末尾がwarning行でも headline はエラー由来になる。"""
+        output = (
+            "ERROR collecting tests/test_x.py\n"
+            "E   ImportError: cannot import name 'xyz'\n"
+            "1 error in 0.5s\n"
+            "===== warnings summary =====\n"
+            "some/path.py:10: DeprecationWarning: old API"
+        )
+        result = parse_pytest_result(output, exit_code=2)
+        # headline は warning ではなく ERROR collecting 行であるべき
+        assert "DeprecationWarning" not in result["headline"]
+        assert "ERROR collecting" in result["headline"]
+
+    def test_errors_count_from_summary(self):
+        """'9 errors in 7.88s' → errors_count=9。"""
+        output = (
+            "ERROR collecting tests/a.py\n"
+            "ERROR collecting tests/b.py\n"
+            "9 errors in 7.88s"
+        )
+        result = parse_pytest_result(output, exit_code=2)
+        assert result["errors_count"] == 9
+
+    def test_errors_count_from_interrupted(self):
+        """'Interrupted: 5 errors during collection' → errors_count=5。"""
+        output = "Interrupted: 5 errors during collection"
+        result = parse_pytest_result(output, exit_code=2)
+        assert result["errors_count"] == 5
+
+    def test_errors_count_zero_when_all_pass(self):
+        """全テスト通過時は errors_count=0。"""
+        output = "20 passed in 0.5s"
+        result = parse_pytest_result(output, exit_code=0)
+        assert result["errors_count"] == 0
+
+    def test_error_lines_extracted(self):
+        """ERROR/E行が error_lines に含まれる。"""
+        output = (
+            "collecting...\n"
+            "ERROR collecting tests/a.py\n"
+            "E   ImportError: foo\n"
+            "ERROR collecting tests/b.py\n"
+            "2 errors in 1s"
+        )
+        result = parse_pytest_result(output, exit_code=2)
+        assert len(result["error_lines"]) >= 3
+
+    def test_error_lines_max_10(self):
+        """error_lines は最大10行。"""
+        lines = [f"ERROR collecting tests/test_{i}.py" for i in range(20)]
+        output = "\n".join(lines) + "\n20 errors in 5s"
+        result = parse_pytest_result(output, exit_code=2)
+        assert len(result["error_lines"]) == 10
+
+    def test_backward_compat_keys(self):
+        """後方互換: 既存キーが全てある。"""
+        result = parse_pytest_result("20 passed in 0.5s", exit_code=0)
+        for key in ("available", "failures", "exit_code", "summary", "tail"):
+            assert key in result
+        # 新キーもある
+        for key in ("headline", "errors_count", "error_lines"):
+            assert key in result
+
+
+# ────────────────────────────────────────
+# generate_candidates description品質テスト
+# ────────────────────────────────────────
+
+class TestCandidateDescription:
+    """候補のdescription/titleが実用的かテスト。"""
+
+    def test_description_uses_headline_not_warning(self):
+        """descriptionにwarning行ではなくheadlineが使われる。"""
+        scan = {
+            "workflow_lint": {"errors": 0, "findings": []},
+            "pytest": {
+                "failures": 1, "exit_code": 2,
+                "summary": "some/path.py:10: DeprecationWarning: old",
+                "headline": "ERROR collecting tests/test_x.py",
+                "errors_count": 1,
+                "error_lines": ["ERROR collecting tests/test_x.py"],
+            },
+        }
+        candidates = generate_candidates(scan)
+        pytest_cand = [c for c in candidates if c["source"] == "pytest"]
+        assert len(pytest_cand) == 1
+        assert "ERROR collecting" in pytest_cand[0]["description"]
+        assert "DeprecationWarning" not in pytest_cand[0]["description"]
+
+    def test_title_shows_errors_count(self):
+        """errors_count > 0 のとき title に '収集エラー修正' が出る。"""
+        scan = {
+            "workflow_lint": {"errors": 0, "findings": []},
+            "pytest": {
+                "failures": 1, "exit_code": 2,
+                "headline": "ERROR collecting",
+                "errors_count": 9,
+                "error_lines": [],
+            },
+        }
+        candidates = generate_candidates(scan)
+        pytest_cand = [c for c in candidates if c["source"] == "pytest"]
+        assert "収集エラー修正" in pytest_cand[0]["title"]
+        assert "9件" in pytest_cand[0]["title"]
+
+    def test_title_shows_failed_count(self):
+        """errors_count=0, failures>0 のとき title に 'テスト失敗修正' が出る。"""
+        scan = {
+            "workflow_lint": {"errors": 0, "findings": []},
+            "pytest": {
+                "failures": 3, "exit_code": 1,
+                "headline": "test_something FAILED",
+                "errors_count": 0,
+                "error_lines": [],
+            },
+        }
+        candidates = generate_candidates(scan)
+        pytest_cand = [c for c in candidates if c["source"] == "pytest"]
+        assert "テスト失敗修正" in pytest_cand[0]["title"]
+        assert "3件" in pytest_cand[0]["title"]
