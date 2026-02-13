@@ -1,0 +1,60 @@
+# --- OS / Editor ---
+.DS_Store
+Thumbs.db
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Virtual env ---
+.venv/
+
+# --- Runtime artifacts ---
+_logs/
+_outputs/
+_screenshots/
+_temp/
+sora_inbox/
+media/
+tmp/*
+!tmp/.gitkeep
+pdca/logs/
+pdca/state.json
+knowledge/learning/learning.db
+knowledge/learning/events.jsonl
+
+# --- Agent runtime data ---
+.agent/golden_profile/
+.agent/workflows/desktop/logs/
+
+# --- Vendored external skills dump (large / nested repos) ---
+.agent/workflows/claude-skills/
+
+# --- Node / build ---
+node_modules/
+Codex-Windows/
+
+# --- Misc ---
+codex_test.log
+$null
+
+# --- デバッグ・一時ファイル ---
+_chatgpt_*
+_codex_*
+_tmp_*
+test_cool.png
+test_warm.png
+
+# --- バックアップ / 不要ディレクトリ ---
+Auto-Accept-Agent-MunKhin-ORIGINAL/
+ag_runs/
+kdenlive/
+.pytest_cache/
+
+# --- Gemini brain ---
+.gemini/

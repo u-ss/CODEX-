@@ -1,0 +1,17 @@
+{
+    "project_id": "YOUR_GCP_PROJECT_ID",
+    "location": "us-central1",
+    "model": "imagen-3.0-generate-002",
+    "credentials_path": "",
+    "defaults": {
+        "aspect_ratio": "16:9",
+        "count": 2,
+        "safety_filter_level": "block_few",
+        "person_generation": "allow_adult"
+    },
+    "gemini": {
+        "model": "gemini-2.0-flash",
+        "api_key_env": "GOOGLE_API_KEY"
+    },
+    "output_base": "_outputs/imagen"
+}

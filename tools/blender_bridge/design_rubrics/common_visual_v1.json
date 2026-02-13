@@ -1,0 +1,41 @@
+{
+  "id": "common_visual_v1",
+  "target": {
+    "domain": "*"
+  },
+  "metric_space": "srgb",
+  "score_threshold": 72.0,
+  "checks": [
+    {
+      "id": "mean_luminance",
+      "metric": "luminance_mean",
+      "scope": "each_view",
+      "min": 0.07,
+      "max": 0.92,
+      "weight": 10.0
+    },
+    {
+      "id": "contrast",
+      "metric": "luminance_std",
+      "scope": "each_view",
+      "min": 0.07,
+      "max": 0.5,
+      "weight": 14.0
+    },
+    {
+      "id": "saturation",
+      "metric": "saturation_mean",
+      "scope": "each_view",
+      "min": 0.05,
+      "max": 0.92,
+      "weight": 8.0
+    },
+    {
+      "id": "view_diversity",
+      "metric": "view_diversity",
+      "scope": "global",
+      "min": 0.03,
+      "weight": 12.0
+    }
+  ]
+}

@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "House Spec",
+  "type": "object",
+  "required": [
+    "style_preset",
+    "floors",
+    "footprint_w_m",
+    "footprint_d_m",
+    "roof_type",
+    "roof_pitch",
+    "quality_mode"
+  ],
+  "properties": {
+    "style_preset": {
+      "type": "string",
+      "minLength": 1
+    },
+    "floors": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 3
+    },
+    "footprint_w_m": {
+      "type": "number",
+      "minimum": 4.0,
+      "maximum": 20.0
+    },
+    "footprint_d_m": {
+      "type": "number",
+      "minimum": 4.0,
+      "maximum": 20.0
+    },
+    "roof_type": {
+      "type": "string",
+      "enum": ["gable", "hip", "shed"]
+    },
+    "roof_pitch": {
+      "type": "number",
+      "minimum": 0.2,
+      "maximum": 0.7
+    },
+    "quality_mode": {
+      "type": "string",
+      "enum": ["draft", "balanced", "photoreal"]
+    },
+    "floor_heights_m": {
+      "type": "array",
+      "items": {
+        "type": "number",
+        "minimum": 2.0,
+        "maximum": 3.5
+      },
+      "minItems": 1
+    },
+    "wall_thickness_m": {
+      "type": "number",
+      "minimum": 0.09,
+      "maximum": 0.3
+    },
+    "eaves_m": {
+      "type": "number",
+      "minimum": 0.2,
+      "maximum": 0.9
+    },
+    "foundation_h_m": {
+      "type": "number",
+      "minimum": 0.2,
+      "maximum": 0.8
+    },
+    "floor_slab_t_m": {
+      "type": "number",
+      "minimum": 0.1,
+      "maximum": 0.5
+    },
+    "door_height_m": {
+      "type": "number",
+      "minimum": 1.8,
+      "maximum": 2.4
+    },
+    "door_width_m": {
+      "type": "number",
+      "minimum": 0.7,
+      "maximum": 1.2
+    },
+    "window_height_m": {
+      "type": "number",
+      "minimum": 0.5,
+      "maximum": 2.4
+    },
+    "window_width_m": {
+      "type": "number",
+      "minimum": 0.5,
+      "maximum": 2.4
+    },
+    "ground_margin_m": {
+      "type": "number",
+      "minimum": 2.0,
+      "maximum": 30.0
+    },
+    "samples": {
+      "type": "integer",
+      "minimum": 16,
+      "maximum": 1024
+    },
+    "assumptions": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "additionalProperties": true
+}

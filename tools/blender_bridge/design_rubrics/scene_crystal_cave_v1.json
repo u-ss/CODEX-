@@ -1,0 +1,42 @@
+{
+  "id": "scene_crystal_cave_v1",
+  "target": {
+    "domain": "scene",
+    "keywords": ["crystal", "cave", "水晶", "洞窟"]
+  },
+  "metric_space": "srgb",
+  "score_threshold": 78.0,
+  "checks": [
+    {
+      "id": "cool_palette",
+      "metric": "cool_ratio",
+      "scope": "each_view",
+      "min": 0.35,
+      "weight": 12.0
+    },
+    {
+      "id": "highlight_presence",
+      "metric": "bright_ratio",
+      "scope": "global",
+      "min": 0.005,
+      "max": 0.24,
+      "weight": 10.0
+    },
+    {
+      "id": "feature_density",
+      "metric": "object_count",
+      "scope": "global",
+      "min": 8,
+      "max": 2200,
+      "weight": 10.0
+    },
+    {
+      "id": "scene_depth",
+      "metric": "bbox_height_over_depth",
+      "scope": "global",
+      "min": 0.16,
+      "max": 1.4,
+      "weight": 8.0
+    }
+  ]
+}

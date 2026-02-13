@@ -1,0 +1,20 @@
+{
+  "style_preset": "JP_WOOD_2F_STANDARD",
+  "floors": 2,
+  "footprint_w_m": 8.0,
+  "footprint_d_m": 6.0,
+  "floor_heights_m": [2.6, 2.4],
+  "wall_thickness_m": 0.18,
+  "roof_type": "gable",
+  "roof_pitch": 0.4,
+  "eaves_m": 0.45,
+  "foundation_h_m": 0.4,
+  "floor_slab_t_m": 0.25,
+  "door_height_m": 2.1,
+  "door_width_m": 0.9,
+  "window_height_m": 1.0,
+  "window_width_m": 1.2,
+  "ground_margin_m": 8.0,
+  "quality_mode": "balanced",
+  "samples": 128
+}

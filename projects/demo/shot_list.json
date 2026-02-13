@@ -1,0 +1,100 @@
+{
+  "schema_version": "1.0.0",
+  "project_slug": "demo",
+  "settings": {
+    "fps": 24,
+    "resolution": {
+      "width": 1920,
+      "height": 1080
+    },
+    "voicevox": {
+      "base_url": "http://127.0.0.1:50021",
+      "speaker": 1,
+      "speedScale": 1.0,
+      "pitchScale": 0.0,
+      "intonationScale": 1.0,
+      "volumeScale": 1.0,
+      "prePhonemeLength": 0.0,
+      "postPhonemeLength": 0.05
+    },
+    "bgm": {
+      "path": null,
+      "volume_db": -16,
+      "fade_in_sec": 0.35,
+      "fade_out_sec": 0.35,
+      "bpm": 120,
+      "offset_sec": 0,
+      "ducking_enabled": true,
+      "duck_threshold": 0.03,
+      "duck_ratio": 8
+    },
+    "look": {
+      "lut_path": null,
+      "contrast": 1.03,
+      "saturation": 1.05,
+      "brightness": 0.0,
+      "gamma": 1.0
+    },
+    "export": {
+      "target_lufs": -14,
+      "truepeak_db": -1
+    },
+    "director": {
+      "mode": "storyboard",
+      "no_paid_api": true,
+      "variants_per_shot": 3,
+      "storyboard_default_duration_sec": 6.0,
+      "storyboard_aspect_ratio": "16:9",
+      "continuity_tokens": [
+        "same actor",
+        "same outfit",
+        "same city at dawn"
+      ],
+      "style_keywords": [
+        "cinematic",
+        "natural light",
+        "high detail",
+        "stable identity"
+      ]
+    },
+    "subtitle_max_chars": 18,
+    "target_duration_sec": null,
+    "beat_snap_max_frames": 8
+  },
+  "shots": [
+    {
+      "id": "s001",
+      "narration": "夜がほどけ、都市が息を吸う。",
+      "subtitle": null,
+      "video": {
+        "inbox_match": "s001"
+      },
+      "timing": {
+        "min_sec": 2.5,
+        "max_sec": 6.0,
+        "post_pad_sec": 0.3
+      },
+      "transition_to_next": {
+        "type": "fade",
+        "duration_frames": 6
+      }
+    },
+    {
+      "id": "s002",
+      "narration": "光の粒が、朝の輪郭を描き始める。",
+      "subtitle": null,
+      "video": {
+        "inbox_match": "s002"
+      },
+      "timing": {
+        "min_sec": 2.5,
+        "max_sec": 6.0,
+        "post_pad_sec": 0.3
+      },
+      "transition_to_next": {
+        "type": "cut",
+        "duration_frames": 0
+      }
+    }
+  ]
+}

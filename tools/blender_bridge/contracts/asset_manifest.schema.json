@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Antigravity External Asset Manifest",
+  "type": "object",
+  "required": ["assets"],
+  "properties": {
+    "assets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "path", "license"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "name": {"type": "string"},
+          "path": {"type": "string", "minLength": 1},
+          "license": {"type": "string", "minLength": 1},
+          "domains": {
+            "type": "array",
+            "items": {"type": "string"}
+          },
+          "tags": {
+            "type": "array",
+            "items": {"type": "string"}
+          },
+          "format": {"type": "string"},
+          "quality_score": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+          "scale_m": {"type": "number", "minimum": 0.001, "maximum": 1000.0},
+          "source": {"type": "string"}
+        }
+      }
+    }
+  }
+}

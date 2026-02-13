@@ -1,0 +1,42 @@
+{
+  "id": "scene_base_lighting_v1",
+  "target": {
+    "domain": "scene"
+  },
+  "metric_space": "srgb",
+  "score_threshold": 74.0,
+  "checks": [
+    {
+      "id": "shadow_presence",
+      "metric": "dark_ratio",
+      "scope": "global",
+      "min": 0.04,
+      "max": 0.85,
+      "weight": 10.0
+    },
+    {
+      "id": "highlight_presence",
+      "metric": "bright_ratio",
+      "scope": "global",
+      "min": 0.003,
+      "max": 0.28,
+      "weight": 10.0
+    },
+    {
+      "id": "feature_density",
+      "metric": "object_count",
+      "scope": "global",
+      "min": 6,
+      "max": 5000,
+      "weight": 8.0
+    },
+    {
+      "id": "scene_depth",
+      "metric": "bbox_height_over_depth",
+      "scope": "global",
+      "min": 0.12,
+      "max": 1.6,
+      "weight": 6.0
+    }
+  ]
+}

@@ -1,0 +1,3 @@
+[submodule "auto-accept-agent"]
+	path = auto-accept-agent
+	url = https://github.com/MunKhin/auto-accept-agent.git

@@ -1,0 +1,214 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://antigravity.local/video/shot_list.schema.json",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "project_slug",
+    "settings",
+    "shots"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string"
+    },
+    "project_slug": {
+      "type": "string",
+      "pattern": "^[a-z0-9_-]+$"
+    },
+    "settings": {
+      "type": "object",
+      "required": [
+        "fps",
+        "resolution",
+        "voicevox",
+        "bgm",
+        "look",
+        "export"
+      ],
+      "properties": {
+        "fps": {
+          "type": "integer",
+          "minimum": 12,
+          "maximum": 120
+        },
+        "resolution": {
+          "type": "object",
+          "required": [
+            "width",
+            "height"
+          ],
+          "properties": {
+            "width": {
+              "type": "integer",
+              "minimum": 16
+            },
+            "height": {
+              "type": "integer",
+              "minimum": 16
+            }
+          },
+          "additionalProperties": true
+        },
+        "director": {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "storyboard"
+              ]
+            },
+            "no_paid_api": {
+              "type": "boolean"
+            },
+            "variants_per_shot": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 5
+            },
+            "storyboard_default_duration_sec": {
+              "type": "number",
+              "minimum": 1,
+              "maximum": 20
+            },
+            "storyboard_aspect_ratio": {
+              "type": "string"
+            },
+            "continuity_tokens": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style_keywords": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "negative_prompt_base": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "shots": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^s[0-9]{3,}$"
+          },
+          "narration": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "subtitle": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "video": {
+            "type": "object",
+            "properties": {
+              "inbox_match": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "additionalProperties": true
+          },
+          "timing": {
+            "type": "object",
+            "properties": {
+              "min_sec": {
+                "type": "number",
+                "minimum": 0.1
+              },
+              "max_sec": {
+                "type": "number",
+                "minimum": 0.1
+              },
+              "post_pad_sec": {
+                "type": "number",
+                "minimum": 0
+              }
+            },
+            "additionalProperties": true
+          },
+          "transition_to_next": {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "cut",
+                  "fade"
+                ]
+              },
+              "duration_frames": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "director_artifacts": {
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "type": "string"
+        },
+        "shot_list_directed": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sora_prompt_pack": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sora_style_guide": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sora_quality_report": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "video_director_v1": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": false
+}

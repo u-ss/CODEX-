@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Live Edit Command",
+  "type": "object",
+  "required": [
+    "intent",
+    "ops",
+    "safety_level",
+    "requires_confirmation"
+  ],
+  "properties": {
+    "intent": {
+      "type": "string"
+    },
+    "target_selector": {
+      "type": "object"
+    },
+    "ops": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["op"],
+        "properties": {
+          "op": { "type": "string" },
+          "target": { "type": "string" },
+          "delta": {
+            "type": "array",
+            "items": { "type": "number" },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "factor": {
+            "type": "array",
+            "items": { "type": "number" },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "color_rgba": {
+            "type": "array",
+            "items": { "type": "number" },
+            "minItems": 4,
+            "maxItems": 4
+          },
+          "new_name": { "type": "string" },
+          "offset": {
+            "type": "array",
+            "items": { "type": "number" },
+            "minItems": 3,
+            "maxItems": 3
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "safety_level": {
+      "type": "string",
+      "enum": ["safe", "caution", "danger"]
+    },
+    "requires_confirmation": {
+      "type": "boolean"
+    },
+    "message": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": true
+}

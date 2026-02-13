@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="ja">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="MiniSNS - シンプルでモダンなソーシャルネットワーク">
+    <title>MiniSNS - ソーシャルネットワーク</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <!-- ログイン画面 -->
+    <div id="auth-screen" class="screen active">
+        <div class="auth-container">
+            <div class="auth-logo">
+                <div class="logo-icon">
+                    <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
+                        <circle cx="24" cy="24" r="22" stroke="url(#grad1)" stroke-width="3" />
+                        <circle cx="24" cy="18" r="7" fill="url(#grad1)" />
+                        <path d="M10 38c0-8 6-14 14-14s14 6 14 14" stroke="url(#grad1)" stroke-width="3"
+                            stroke-linecap="round" />
+                        <defs>
+                            <linearGradient id="grad1" x1="0" y1="0" x2="48" y2="48">
+                                <stop stop-color="#6366f1" />
+                                <stop offset="1" stop-color="#ec4899" />
+                            </linearGradient>
+                        </defs>
+                    </svg>
+                </div>
+                <h1 class="auth-title">MiniSNS</h1>
+                <p class="auth-subtitle">あなたの世界をシェアしよう</p>
+            </div>
+            <form id="auth-form" class="auth-form">
+                <div class="form-group">
+                    <label for="username">ユーザー名</label>
+                    <input type="text" id="username" placeholder="名前を入力..." required minlength="2" maxlength="20"
+                        autocomplete="off">
+                </div>
+                <div class="form-group" id="bio-group" style="display:none;">
+                    <label for="user-bio">自己紹介</label>
+                    <textarea id="user-bio" placeholder="自己紹介を書いてね..." rows="2" maxlength="100"></textarea>
+                </div>
+                <button type="submit" class="btn btn-primary btn-full" id="auth-btn">はじめる</button>
+                <p class="auth-note" id="auth-note">既にアカウントがあれば同じ名前でログインできます</p>
+            </form>
+        </div>
+    </div>
+
+    <!-- メイン画面 -->
+    <div id="main-screen" class="screen">
+        <!-- ヘッダー -->
+        <header class="header">
+            <div class="header-inner">
+                <div class="header-logo">
+                    <svg width="28" height="28" viewBox="0 0 48 48" fill="none">
+                        <circle cx="24" cy="24" r="22" stroke="url(#grad2)" stroke-width="3" />
+                        <circle cx="24" cy="18" r="7" fill="url(#grad2)" />
+                        <path d="M10 38c0-8 6-14 14-14s14 6 14 14" stroke="url(#grad2)" stroke-width="3"
+                            stroke-linecap="round" />
+                        <defs>
+                            <linearGradient id="grad2" x1="0" y1="0" x2="48" y2="48">
+                                <stop stop-color="#6366f1" />
+                                <stop offset="1" stop-color="#ec4899" />
+                            </linearGradient>
+                        </defs>
+                    </svg>
+                    <span>MiniSNS</span>
+                </div>
+                <div class="header-actions">
+                    <span id="current-user-name" class="user-badge"></span>
+                    <button id="logout-btn" class="btn btn-ghost btn-sm">ログアウト</button>
+                </div>
+            </div>
+        </header>
+
+        <!-- コンテンツ -->
+        <main class="main-content">
+            <!-- 投稿フォーム -->
+            <div class="post-composer">
+                <div class="composer-avatar" id="composer-avatar">U</div>
+                <div class="composer-body">
+                    <textarea id="post-input" placeholder="今なにしてる？" rows="3" maxlength="500"></textarea>
+                    <div class="composer-footer">
+                        <span class="char-count"><span id="char-count">0</span>/500</span>
+                        <button id="post-btn" class="btn btn-primary btn-sm" disabled>投稿する</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- フィード -->
+            <div id="feed" class="feed">
+                <div class="feed-empty" id="feed-empty">
+                    <div class="empty-icon">📝</div>
+                    <p>まだ投稿がありません</p>
+                    <p class="text-muted">最初の投稿を書いてみましょう！</p>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- トースト通知 -->
+    <div id="toast-container" class="toast-container"></div>
+
+    <script src="app.js"></script>
+</body>
+
+</html>

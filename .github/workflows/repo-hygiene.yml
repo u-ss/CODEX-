@@ -1,0 +1,30 @@
+name: Repo Hygiene
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Workflow Lint
+        run: python tools/workflow_lint.py
+
+      - name: Repo Hygiene Check
+        run: python tools/repo_hygiene_check.py
+
+      - name: Pytest (all)
+        run: python -m pytest -q
+
+      - name: Code Lib Tests
+        run: python -m pytest .agent/workflows/code/lib/tests -q

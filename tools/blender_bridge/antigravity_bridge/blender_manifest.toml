@@ -1,0 +1,33 @@
+schema_version = "1.0.0"
+
+id = "antigravity_bridge"
+version = "0.1.0"
+name = "Antigravity Bridge"
+tagline = "RPC bridge for AI agents to control Blender"
+maintainer = "Antigravity <antigravity@example.com>"
+type = "add-on"
+
+website = "https://github.com/antigravity/blender-bridge"
+tags = ["3D View", "User Interface"]
+
+# Blender 5.0以上を要求
+blender_version_min = "5.0.0"
+
+license = [
+  "SPDX:GPL-2.0-or-later",
+]
+
+# エージェント連携に必要な権限
+[permissions]
+network = "Receive remote procedure calls from an AI agent"
+files = "Read and write .blend files and render outputs for automation"
+
+# パッケージから除外するファイル
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "/.git/",
+  "/*.zip",
+  "/tests/",
+  "/.github/",
+]

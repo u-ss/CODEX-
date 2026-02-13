@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Antigravity Character Validation",
+  "type": "object",
+  "required": [
+    "dimension_checks",
+    "topology_checks",
+    "budget_checks",
+    "score",
+    "pass",
+    "repair_actions"
+  ],
+  "properties": {
+    "dimension_checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "expected", "actual", "tolerance", "pass", "severity"],
+        "properties": {
+          "name": {"type": "string"},
+          "expected": {"type": "number"},
+          "actual": {"type": "number"},
+          "tolerance": {"type": "number", "minimum": 0.0},
+          "pass": {"type": "boolean"},
+          "severity": {"type": "string", "enum": ["critical", "major", "minor"]}
+        }
+      }
+    },
+    "topology_checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "pass", "detail", "severity"],
+        "properties": {
+          "name": {"type": "string"},
+          "pass": {"type": "boolean"},
+          "detail": {"type": "string"},
+          "severity": {"type": "string", "enum": ["critical", "major", "minor"]}
+        }
+      }
+    },
+    "part_checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "pass", "detail"],
+        "properties": {
+          "name": {"type": "string"},
+          "pass": {"type": "boolean"},
+          "detail": {"type": "string"}
+        }
+      }
+    },
+    "symmetry_checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "pass"],
+        "properties": {
+          "name": {"type": "string"},
+          "pass": {"type": "boolean"},
+          "position_error_m": {"type": ["number", "null"]},
+          "height_error_m": {"type": ["number", "null"]},
+          "scale_error": {"type": ["number", "null"]},
+          "tolerance_m": {"type": "number", "minimum": 0.0}
+        }
+      }
+    },
+    "rig_checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "required", "pass", "detail"],
+        "properties": {
+          "name": {"type": "string"},
+          "required": {"type": "boolean"},
+          "pass": {"type": "boolean"},
+          "detail": {"type": "string"}
+        }
+      }
+    },
+    "budget_checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "budget", "actual", "pass", "severity"],
+        "properties": {
+          "name": {"type": "string"},
+          "budget": {"type": "number"},
+          "actual": {"type": "number"},
+          "pass": {"type": "boolean"},
+          "severity": {"type": "string", "enum": ["critical", "major", "minor"]}
+        }
+      }
+    },
+    "asset_checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "pass", "detail"],
+        "properties": {
+          "id": {"type": "string"},
+          "pass": {"type": "boolean"},
+          "detail": {"type": "string"}
+        }
+      }
+    },
+    "score": {"type": "number", "minimum": 0.0, "maximum": 100.0},
+    "pass": {"type": "boolean"},
+    "repair_actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["action", "key"],
+        "properties": {
+          "action": {"type": "string"},
+          "key": {"type": "string"},
+          "value": {},
+          "min": {"type": "number"},
+          "max": {"type": "number"},
+          "factor": {"type": "number"},
+          "reason": {"type": "string"}
+        }
+      }
+    },
+    "notes": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "critical_failures": {
+      "type": "array",
+      "items": {"type": "string"}
+    }
+  }
+}

@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="ja">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>画像好み判定ツール | Image Preference Analyzer</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Noto+Sans+JP:wght@300;400;500;700&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+
+<body>
+    <div class="app">
+        <!-- ヘッダー -->
+        <header class="header">
+            <div class="header-content">
+                <div class="logo">
+                    <span class="logo-icon">🎨</span>
+                    <h1>Image Preference AI</h1>
+                </div>
+                <div class="status-badge" id="statusBadge">
+                    <span class="status-dot"></span>
+                    <span class="status-text">読み込み中...</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- メインコンテンツ -->
+        <main class="main">
+            <!-- タブナビゲーション -->
+            <nav class="tabs">
+                <button class="tab active" data-tab="judge">
+                    <span class="tab-icon">🔍</span>
+                    <span class="tab-label">判定</span>
+                </button>
+                <button class="tab" data-tab="train">
+                    <span class="tab-icon">🧠</span>
+                    <span class="tab-label">学習</span>
+                </button>
+                <button class="tab" data-tab="analysis">
+                    <span class="tab-icon">📊</span>
+                    <span class="tab-label">分析</span>
+                </button>
+            </nav>
+
+            <!-- ========== 判定タブ ========== -->
+            <section class="tab-panel active" id="panel-judge">
+                <div class="panel-header">
+                    <h2>画像を判定する</h2>
+                    <p>画像をドロップまたは選択して、あなたの好みに合うか判定します</p>
+                </div>
+
+                <div class="drop-zone" id="judgeDropZone">
+                    <div class="drop-zone-content">
+                        <span class="drop-icon">📸</span>
+                        <p class="drop-text">画像をドラッグ＆ドロップ</p>
+                        <p class="drop-sub">または</p>
+                        <label class="file-button">
+                            ファイルを選択
+                            <input type="file" id="judgeFileInput" accept="image/*" hidden>
+                        </label>
+                    </div>
+                </div>
+
+                <!-- 判定結果 -->
+                <div class="result-card hidden" id="judgeResult">
+                    <div class="result-header" id="resultHeader">
+                        <div class="verdict-circle" id="verdictCircle">
+                            <span class="verdict-text" id="verdictText">OK</span>
+                        </div>
+                        <div class="verdict-info">
+                            <h3 id="verdictLabel">好き</h3>
+                            <div class="like-score">
+                                <span>好き度</span>
+                                <div class="score-bar">
+                                    <div class="score-fill" id="scoreFill"></div>
+                                </div>
+                                <span class="score-value" id="scoreValue">85</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="probabilities" id="probabilities"></div>
+                </div>
+
+                <!-- 判定する画像のプレビュー -->
+                <div class="preview-area hidden" id="judgePreview">
+                    <img id="previewImage" alt="プレビュー">
+                </div>
+            </section>
+
+            <!-- ========== 学習タブ ========== -->
+            <section class="tab-panel" id="panel-train">
+                <div class="panel-header">
+                    <h2>好みを学習させる</h2>
+                    <p>各カテゴリに画像を配置して、あなたの好みをAIに学習させます</p>
+                </div>
+
+                <div class="training-grid">
+                    <!-- 好き -->
+                    <div class="training-category" data-category="好き">
+                        <div class="category-header like">
+                            <span class="category-emoji">❤️</span>
+                            <h3>好き</h3>
+                            <span class="category-count" id="count-好き">0枚</span>
+                        </div>
+                        <div class="category-dropzone" data-category="好き">
+                            <span>画像をドロップ</span>
+                            <label class="small-file-button">
+                                + 追加
+                                <input type="file" class="category-file-input" data-category="好き" accept="image/*"
+                                    multiple hidden>
+                            </label>
+                        </div>
+                        <div class="category-images" id="images-好き"></div>
+                    </div>
+
+                    <!-- そうでもない -->
+                    <div class="training-category" data-category="そうでもない">
+                        <div class="category-header neutral">
+                            <span class="category-emoji">😐</span>
+                            <h3>そうでもない</h3>
+                            <span class="category-count" id="count-そうでもない">0枚</span>
+                        </div>
+                        <div class="category-dropzone" data-category="そうでもない">
+                            <span>画像をドロップ</span>
+                            <label class="small-file-button">
+                                + 追加
+                                <input type="file" class="category-file-input" data-category="そうでもない" accept="image/*"
+                                    multiple hidden>
+                            </label>
+                        </div>
+                        <div class="category-images" id="images-そうでもない"></div>
+                    </div>
+
+                    <!-- 嫌い -->
+                    <div class="training-category" data-category="嫌い">
+                        <div class="category-header dislike">
+                            <span class="category-emoji">💔</span>
+                            <h3>嫌い</h3>
+                            <span class="category-count" id="count-嫌い">0枚</span>
+                        </div>
+                        <div class="category-dropzone" data-category="嫌い">
+                            <span>画像をドロップ</span>
+                            <label class="small-file-button">
+                                + 追加
+                                <input type="file" class="category-file-input" data-category="嫌い" accept="image/*"
+                                    multiple hidden>
+                            </label>
+                        </div>
+                        <div class="category-images" id="images-嫌い"></div>
+                    </div>
+                </div>
+
+                <button class="train-button" id="trainButton" onclick="startTraining()">
+                    <span class="btn-icon">🚀</span>
+                    学習を開始する
+                </button>
+
+                <div class="training-result hidden" id="trainingResult">
+                    <h3>📊 学習結果</h3>
+                    <div id="trainingStats"></div>
+                </div>
+            </section>
+
+            <section class="tab-panel" id="panel-analysis">
+                <div class="panel-header">
+                    <h2>好みの傾向分析</h2>
+                    <p>あなたの好みの傾向を技術的に分析します</p>
+                </div>
+
+                <button class="analyze-button" onclick="runAnalysis()">
+                    <span class="btn-icon">🔬</span>
+                    分析を実行する
+                </button>
+
+                <div class="analysis-result hidden" id="analysisResult">
+                    <!-- 好みプロファイル -->
+                    <div class="preference-profile hidden" id="preferenceProfile">
+                        <h3>🎯 あなたの好みプロファイル</h3>
+                        <div class="profile-content" id="profileContent"></div>
+                    </div>
+                    <!-- サマリー -->
+                    <div class="analysis-section" id="analysisSummary"></div>
+                    <!-- 詳細 -->
+                    <div class="analysis-details" id="analysisDetails"></div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script src="/static/app.js"></script>
+
+    <!-- 理由入力モーダル -->
+    <div class="reason-modal-overlay hidden" id="reasonModal">
+        <div class="reason-modal">
+            <button class="modal-close" onclick="closeReasonModal()">×</button>
+            <div class="modal-image-container">
+                <img id="modalImage" alt="画像プレビュー">
+            </div>
+            <div class="modal-body">
+                <h3 id="modalTitle">画像の理由を記入</h3>
+                <p class="modal-category" id="modalCategory"></p>
+                <textarea id="modalReasonInput" placeholder="この画像が好き（嫌い）な理由を書いてください...例：色のグラデーションが綺麗、構図がダイナミック"
+                    rows="4"></textarea>
+                <div class="refine-area">
+                    <button class="refine-btn" onclick="refineReasonText()" title="入力テキストをAIが校正・言語化します">
+                        ✨ AIが校正
+                    </button>
+                    <div class="refine-preview hidden" id="refinePreview">
+                        <div class="refine-label">📝 校正結果:</div>
+                        <div class="refine-text" id="refineText"></div>
+                        <div class="refine-keywords" id="refineKeywords"></div>
+                        <button class="refine-apply-btn" onclick="applyRefinedText()">この表現を使う</button>
+                    </div>
+                </div>
+                <div class="modal-actions">
+                    <button class="modal-save-btn" onclick="saveReasonFromModal()">
+                        💾 保存する
+                    </button>
+                    <button class="modal-cancel-btn" onclick="closeReasonModal()">
+                        キャンセル
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+
+</html>

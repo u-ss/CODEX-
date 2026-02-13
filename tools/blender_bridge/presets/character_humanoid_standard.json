@@ -1,0 +1,29 @@
+{
+  "domain": "character",
+  "style_preset": "HUMANOID_STANDARD_V1",
+  "character_type": "humanoid",
+  "quality_mode": "balanced",
+  "dimensions_m": {
+    "width": 0.7,
+    "depth": 0.45,
+    "height": 1.72
+  },
+  "target_constraints": {
+    "poly_budget": 450000,
+    "min_objects": 12,
+    "symmetry_tolerance_m": 0.02,
+    "require_rig": true
+  },
+  "required_outputs": {
+    "blend": true,
+    "renders": 3,
+    "validation_json": true
+  },
+  "composition": {
+    "style_tags": ["stylized"],
+    "parts": [],
+    "selected_assets": []
+  },
+  "reference_images": [],
+  "target_parts": []
+}

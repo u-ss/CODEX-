@@ -1,0 +1,169 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Antigravity Universal Asset Spec",
+  "type": "object",
+  "required": [
+    "domain",
+    "intent",
+    "quality_mode",
+    "dimensions_m",
+    "composition",
+    "target_constraints",
+    "required_outputs"
+  ],
+  "properties": {
+    "domain": {
+      "type": "string",
+      "enum": [
+        "house",
+        "product",
+        "furniture",
+        "vehicle",
+        "scene",
+        "prop",
+        "character"
+      ]
+    },
+    "intent": {
+      "type": "string",
+      "minLength": 1
+    },
+    "quality_mode": {
+      "type": "string",
+      "enum": [
+        "draft",
+        "balanced",
+        "high"
+      ]
+    },
+    "dimensions_m": {
+      "type": "object",
+      "required": ["width", "depth", "height"],
+      "properties": {
+        "width": {"type": "number", "minimum": 0.1, "maximum": 200.0},
+        "depth": {"type": "number", "minimum": 0.1, "maximum": 200.0},
+        "height": {"type": "number", "minimum": 0.1, "maximum": 200.0}
+      }
+    },
+    "composition": {
+      "type": "object",
+      "properties": {
+        "style_tags": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "parts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "shape"],
+            "properties": {
+              "name": {"type": "string"},
+              "shape": {
+                "type": "string",
+                "enum": ["cube", "sphere", "cylinder", "cone", "torus", "plane"]
+              },
+              "size": {
+                "type": "array",
+                "minItems": 3,
+                "maxItems": 3,
+                "items": {"type": "number", "minimum": 0.01, "maximum": 200.0}
+              },
+              "location": {
+                "type": "array",
+                "minItems": 3,
+                "maxItems": 3,
+                "items": {"type": "number", "minimum": -500.0, "maximum": 500.0}
+              },
+              "rotation_deg": {
+                "type": "array",
+                "minItems": 3,
+                "maxItems": 3,
+                "items": {"type": "number", "minimum": -360.0, "maximum": 360.0}
+              },
+              "color": {
+                "type": "array",
+                "minItems": 4,
+                "maxItems": 4,
+                "items": {"type": "number", "minimum": 0.0, "maximum": 1.0}
+              }
+            }
+          }
+        },
+        "selected_assets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "path", "license"],
+            "properties": {
+              "id": {"type": "string"},
+              "path": {"type": "string"},
+              "license": {"type": "string"},
+              "format": {"type": "string"},
+              "location": {
+                "type": "array",
+                "minItems": 3,
+                "maxItems": 3,
+                "items": {"type": "number"}
+              },
+              "rotation_deg": {
+                "type": "array",
+                "minItems": 3,
+                "maxItems": 3,
+                "items": {"type": "number"}
+              },
+              "scale": {
+                "type": "array",
+                "minItems": 3,
+                "maxItems": 3,
+                "items": {"type": "number", "minimum": 0.01, "maximum": 100.0}
+              }
+            }
+          }
+        }
+      }
+    },
+    "target_constraints": {
+      "type": "object",
+      "required": ["poly_budget", "min_objects"],
+      "properties": {
+        "poly_budget": {"type": "integer", "minimum": 100, "maximum": 50000000},
+        "min_objects": {"type": "integer", "minimum": 1, "maximum": 10000}
+      }
+    },
+    "required_outputs": {
+      "type": "object",
+      "required": ["blend", "renders", "validation_json"],
+      "properties": {
+        "blend": {"type": "boolean"},
+        "renders": {"type": "integer", "minimum": 1, "maximum": 10},
+        "validation_json": {"type": "boolean"}
+      }
+    },
+    "render_tuning": {
+      "type": "object",
+      "properties": {
+        "key_light_energy": {"type": "number", "minimum": 0.1, "maximum": 20000.0},
+        "fill_light_energy": {"type": "number", "minimum": 0.1, "maximum": 20000.0},
+        "camera_distance_scale": {"type": "number", "minimum": 0.35, "maximum": 3.2},
+        "exposure": {"type": "number", "minimum": -5.0, "maximum": 5.0},
+        "saturation": {"type": "number", "minimum": 0.2, "maximum": 2.5},
+        "value_scale": {"type": "number", "minimum": 0.2, "maximum": 2.0},
+        "color_balance": {"type": "string", "enum": ["neutral", "cool", "warm"]}
+      }
+    },
+    "procedural_controls": {
+      "type": "object",
+      "properties": {
+        "feature_density": {"type": "number", "minimum": 0.2, "maximum": 5.0},
+        "feature_variation": {"type": "number", "minimum": 0.05, "maximum": 1.0},
+        "emissive_strength": {"type": "number", "minimum": 0.0, "maximum": 8.0}
+      }
+    },
+    "assumptions": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "source_prompt": {"type": "string"}
+  }
+}
