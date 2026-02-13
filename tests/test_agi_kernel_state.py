@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AGI Kernel — state.json の save/load/resume ユニットテスト
+AGI Kernel — ユニットテスト
+
+StateManager, FileLock, parse_pytest_result, 候補生成/選択, 失敗分類 のテスト。
 """
 
 import json
+import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -18,12 +22,14 @@ if str(_SCRIPT_DIR) not in sys.path:
 
 from agi_kernel import (
     StateManager,
+    FileLock,
     classify_failure,
     generate_candidates,
     select_task,
     record_failure,
     parse_pytest_result,
     MAX_TASK_FAILURES,
+    LOCK_TTL_SECONDS,
 )
 
 
@@ -80,6 +86,149 @@ class TestStateManager:
         path = sm.save_report(report, "20260214")
         assert path.exists()
 
+    def test_atomic_write_creates_backup(self, tmp_path: Path):
+        """save()で既存state.jsonのバックアップ(.bak)が作られる。"""
+        sm = StateManager(tmp_path)
+        state1 = sm.new_state()
+        state1["cycle_id"] = "first_cycle"
+        sm.save(state1)
+
+        # 2回目のsaveでバックアップが作られる
+        state2 = sm.new_state()
+        state2["cycle_id"] = "second_cycle"
+        sm.save(state2)
+
+        assert sm._bak_path.exists()
+        bak_data = json.loads(sm._bak_path.read_text(encoding="utf-8"))
+        assert bak_data["cycle_id"] == "first_cycle"
+
+    def test_atomic_write_no_tmp_left(self, tmp_path: Path):
+        """save()後にtmpファイルが残らない。"""
+        sm = StateManager(tmp_path)
+        sm.save(sm.new_state())
+        assert not sm._tmp_path.exists()
+        assert sm.state_path.exists()
+
+    def test_load_fallback_to_bak(self, tmp_path: Path):
+        """state.jsonが壊れていても.bakから復旧できる。"""
+        sm = StateManager(tmp_path)
+        # 正常なstateを保存
+        state = sm.new_state()
+        state["cycle_id"] = "good_cycle"
+        sm.save(state)
+
+        # state.jsonを壊す
+        sm.state_path.write_text("{corrupted!", encoding="utf-8")
+
+        # .bakを手動作成（save時にバックアップされなかったケース想定）
+        sm._bak_path.write_text(
+            json.dumps({"cycle_id": "backup_cycle", "version": "0.2.0"}),
+            encoding="utf-8",
+        )
+
+        loaded = sm.load()
+        assert loaded is not None
+        assert loaded["cycle_id"] == "backup_cycle"
+
+    def test_load_both_missing(self, tmp_path: Path):
+        """state.jsonも.bakも無い場合はNone。"""
+        sm = StateManager(tmp_path)
+        assert sm.load() is None
+
+    def test_load_state_corrupted_bak_missing(self, tmp_path: Path):
+        """state.jsonが壊れていて.bakも無い場合はNone。"""
+        sm = StateManager(tmp_path)
+        sm.state_path.parent.mkdir(parents=True, exist_ok=True)
+        sm.state_path.write_text("{bad}", encoding="utf-8")
+        assert sm.load() is None
+
+
+# ────────────────────────────────────────
+# FileLock テスト
+# ────────────────────────────────────────
+
+class TestFileLock:
+    """FileLockの排他制御テスト。"""
+
+    def test_acquire_and_release(self, tmp_path: Path):
+        """ロックの取得と解放。"""
+        lock = FileLock(tmp_path / "lock")
+        assert lock.acquire() is True
+        assert lock.lock_path.exists()
+        lock.release()
+        assert not lock.lock_path.exists()
+
+    def test_double_acquire_fails(self, tmp_path: Path):
+        """同じロックを2回取得できない。"""
+        lock_path = tmp_path / "lock"
+        lock1 = FileLock(lock_path)
+        lock2 = FileLock(lock_path)
+
+        assert lock1.acquire() is True
+        assert lock2.acquire() is False  # 2回目は失敗
+
+        lock1.release()
+
+    def test_acquire_after_release(self, tmp_path: Path):
+        """解放後は再取得できる。"""
+        lock_path = tmp_path / "lock"
+        lock1 = FileLock(lock_path)
+        assert lock1.acquire() is True
+        lock1.release()
+
+        lock2 = FileLock(lock_path)
+        assert lock2.acquire() is True
+        lock2.release()
+
+    def test_stale_lock_recovery(self, tmp_path: Path):
+        """TTL超過のstale lockは回収できる。"""
+        lock_path = tmp_path / "lock"
+
+        # 古いロックを手動作成
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text(
+            json.dumps({"pid": 99999, "created_at": time.time() - 9999}),
+            encoding="utf-8",
+        )
+
+        # TTL=1秒で回収可能（実際のage >> 1秒）
+        lock = FileLock(lock_path, ttl=1)
+        assert lock.acquire() is True
+        lock.release()
+
+    def test_valid_lock_not_recovered(self, tmp_path: Path):
+        """TTL内のロックは回収されない。"""
+        lock_path = tmp_path / "lock"
+
+        # 新しいロックを手動作成
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text(
+            json.dumps({"pid": 99999, "created_at": time.time()}),
+            encoding="utf-8",
+        )
+
+        lock = FileLock(lock_path, ttl=9999)
+        assert lock.acquire() is False
+
+    def test_context_manager_releases(self, tmp_path: Path):
+        """context managerで自動解放される。"""
+        lock_path = tmp_path / "lock"
+        lock = FileLock(lock_path)
+        lock.acquire()
+        with lock:
+            assert lock.lock_path.exists()
+        assert not lock.lock_path.exists()
+
+    def test_corrupted_lock_recovered(self, tmp_path: Path):
+        """壊れたロックファイルは回収される。"""
+        lock_path = tmp_path / "lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text("this is not json", encoding="utf-8")
+
+        lock = FileLock(lock_path)
+        assert lock.acquire() is True
+        lock.release()
+
 
 # ────────────────────────────────────────
 # Resume分岐テスト
@@ -98,7 +247,6 @@ class TestResumeBehavior:
         loaded = sm.load()
         assert loaded is not None
         assert loaded["status"] == "COMPLETED"
-        # 完了済み → 新規サイクル開始（ロジックはrun_cycle内）
 
     def test_resume_with_running_state(self, tmp_path: Path):
         """RUNNING状態のstateがある場合、再開可能。"""
@@ -309,4 +457,3 @@ class TestParsePytestResult:
         """exit_code=-1 はタイムアウト等の特殊値。failures補正しない。"""
         result = parse_pytest_result("", exit_code=-1)
         assert result["failures"] == 0  # -1は補正対象外
-

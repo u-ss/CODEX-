@@ -13,13 +13,15 @@ AGI Kernel — 自己改善ループ MVP
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Optional
@@ -79,15 +81,91 @@ def classify_failure(error_msg: str) -> str:
 
 
 # ============================================================
+# FileLock — 多重起動防止
+# ============================================================
+
+# ロックのTTL（秒）。この時間を超えた stale lock は回収する
+LOCK_TTL_SECONDS = 600  # 10分
+
+
+class FileLock:
+    """Cross-platform なファイルベースのロック。
+
+    lockファイルを排他的に作成することで多重起動を防ぐ。
+    TTL超過のstale lockは自動回収する。
+    """
+
+    def __init__(self, lock_path: Path, ttl: int = LOCK_TTL_SECONDS):
+        self.lock_path = lock_path
+        self.ttl = ttl
+        self._acquired = False
+
+    def acquire(self) -> bool:
+        """ロックを取得する。成功ならTrue。"""
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # stale lock を回収
+        if self.lock_path.exists():
+            try:
+                content = json.loads(self.lock_path.read_text(encoding="utf-8"))
+                created_at = content.get("created_at", 0)
+                if (time.time() - created_at) > self.ttl:
+                    print(f"[LOCK] stale lock を回収 (age={time.time() - created_at:.0f}s > TTL={self.ttl}s)")
+                    self.lock_path.unlink(missing_ok=True)
+                else:
+                    # 有効なロックが存在
+                    return False
+            except (json.JSONDecodeError, OSError, ValueError):
+                # ロックファイルが壊れている → 回収
+                self.lock_path.unlink(missing_ok=True)
+
+        # O_CREAT|O_EXCL で排他作成（cross-platform）
+        try:
+            fd = os.open(str(self.lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                lock_data = json.dumps({
+                    "pid": os.getpid(),
+                    "created_at": time.time(),
+                    "created_iso": datetime.now(JST).isoformat(),
+                }).encode("utf-8")
+                os.write(fd, lock_data)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            self._acquired = True
+            return True
+        except FileExistsError:
+            # 別プロセスが先にロックを取得
+            return False
+
+    def release(self) -> None:
+        """ロックを解放する。"""
+        if self._acquired:
+            self.lock_path.unlink(missing_ok=True)
+            self._acquired = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.release()
+
+
+# ============================================================
 # StateManager — state.json の保存/読込/再開
 # ============================================================
 
 class StateManager:
-    """AGI Kernelの状態を管理する。"""
+    """AGI Kernelの状態を管理する。
+
+    v0.2.0: atomic write + backup + .bak fallback
+    """
 
     def __init__(self, output_dir: Path):
         self.output_dir = output_dir
         self.state_path = output_dir / "state.json"
+        self._bak_path = output_dir / "state.json.bak"
+        self._tmp_path = output_dir / "state.json.tmp"
 
     def new_state(self) -> dict[str, Any]:
         """新規サイクル用の初期stateを生成する。"""
@@ -109,20 +187,53 @@ class StateManager:
         }
 
     def load(self) -> Optional[dict[str, Any]]:
-        """state.jsonを読み込む。存在しなければNone。"""
-        if not self.state_path.exists():
+        """state.jsonを読み込む。壊れていれば.bakをフォールバック。"""
+        # まず state.json を試す
+        data = self._try_load(self.state_path)
+        if data is not None:
+            return data
+        # state.json が無い/壊れている → .bak を試す
+        data = self._try_load(self._bak_path)
+        if data is not None:
+            print("[StateManager] state.jsonが破損。state.json.bakから復旧しました。")
+        return data
+
+    @staticmethod
+    def _try_load(path: Path) -> Optional[dict[str, Any]]:
+        """指定パスのJSONを読み込む。失敗ならNone。"""
+        if not path.exists():
             return None
         try:
-            with open(self.state_path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError):
             return None
 
     def save(self, state: dict[str, Any]) -> None:
-        """state.jsonを保存する。"""
+        """state.jsonをatomic writeで保存する。
+
+        手順:
+        1. 既存 state.json → state.json.bak にコピー
+        2. state.json.tmp に書き込み + fsync
+        3. os.replace で state.json に置換（atomic）
+        """
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        with open(self.state_path, "w", encoding="utf-8") as f:
+
+        # 1. バックアップ
+        if self.state_path.exists():
+            try:
+                shutil.copy2(str(self.state_path), str(self._bak_path))
+            except OSError:
+                pass  # バックアップ失敗は致命的でない
+
+        # 2. tmp に書き込み + fsync
+        with open(self._tmp_path, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+
+        # 3. atomic replace
+        os.replace(str(self._tmp_path), str(self.state_path))
 
     def save_candidates(self, candidates: list[dict], date_str: str) -> Path:
         """日付フォルダにcandidates.jsonを保存する。"""
@@ -342,6 +453,28 @@ def _record_ki(outcome: str, **kwargs) -> None:
 
 
 # ============================================================
+# フェーズ順序定義（--resume 用）
+# ============================================================
+
+PHASE_ORDER = ["BOOT", "SCAN", "SENSE", "SELECT", "EXECUTE", "VERIFY", "LEARN", "CHECKPOINT"]
+
+
+def _should_skip_phase(current_phase: str, target_phase: str) -> bool:
+    """resume時、target_phaseが既に完了済みかを判定する。
+
+    current_phaseは「最後に完了したphase」ではなく「最後に開始したphase」。
+    よってcurrent_phase自体はやり直す（安全側）。
+    """
+    try:
+        current_idx = PHASE_ORDER.index(current_phase)
+        target_idx = PHASE_ORDER.index(target_phase)
+        # target が current より前 → スキップ
+        return target_idx < current_idx
+    except ValueError:
+        return False
+
+
+# ============================================================
 # メインサイクル
 # ============================================================
 
@@ -350,6 +483,27 @@ def run_cycle(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
     output_dir = workspace / "_outputs" / "agi_kernel"
     sm = StateManager(output_dir)
+
+    # ── LOCK ──
+    lock = FileLock(output_dir / "lock")
+    if not lock.acquire():
+        print("[LOCK] 別のAGI Kernelプロセスが実行中です。終了します。")
+        return 2
+
+    try:
+        return _run_cycle_inner(args, workspace, output_dir, sm)
+    finally:
+        lock.release()
+
+
+def _run_cycle_inner(
+    args: argparse.Namespace,
+    workspace: Path,
+    output_dir: Path,
+    sm: StateManager,
+) -> int:
+    """ロック取得後の内部サイクル実行。"""
+    resume_phase: Optional[str] = None
 
     # ── BOOT ──
     if args.resume:
@@ -367,6 +521,10 @@ def run_cycle(args: argparse.Namespace) -> int:
             if state.get("status") == "COMPLETED":
                 print("[BOOT] 前回サイクルは完了済み。新規サイクルを開始します。")
                 state = sm.new_state()
+            else:
+                # RUNNING → phaseを尊重して再開
+                resume_phase = state.get("phase", "BOOT")
+                print(f"[BOOT] phase={resume_phase} からやり直します。")
     else:
         state = sm.new_state()
 
@@ -375,89 +533,117 @@ def run_cycle(args: argparse.Namespace) -> int:
     date_str = datetime.now(JST).strftime("%Y%m%d")
 
     print(f"[BOOT] サイクル開始: cycle_id={state['cycle_id']}")
+    sm.save(state)  # BOOT checkpoint
 
     # ── SCAN ──
-    state["phase"] = "SCAN"
-    print("[SCAN] リポジトリスキャン中...")
-    scanner = Scanner(workspace)
-    lint_result = scanner.run_workflow_lint()
-    pytest_result = scanner.run_pytest()
-    state["scan_results"] = {
-        "workflow_lint": lint_result,
-        "pytest": pytest_result,
-        "workflow_lint_errors": lint_result.get("errors", 0),
-        "pytest_failures": pytest_result.get("failures", 0),
-        "total_issues": max(0, lint_result.get("errors", 0)) + max(0, pytest_result.get("failures", 0)),
-    }
-    print(f"[SCAN] lint_errors={lint_result.get('errors', 0)}, pytest_failures={pytest_result.get('failures', 0)}")
+    if not (resume_phase and _should_skip_phase(resume_phase, "SCAN")):
+        state["phase"] = "SCAN"
+        print("[SCAN] リポジトリスキャン中...")
+        scanner = Scanner(workspace)
+        lint_result = scanner.run_workflow_lint()
+        pytest_result = scanner.run_pytest()
+        state["scan_results"] = {
+            "workflow_lint": lint_result,
+            "pytest": pytest_result,
+            "workflow_lint_errors": lint_result.get("errors", 0),
+            "pytest_failures": pytest_result.get("failures", 0),
+            "total_issues": max(0, lint_result.get("errors", 0)) + max(0, pytest_result.get("failures", 0)),
+        }
+        print(f"[SCAN] lint_errors={lint_result.get('errors', 0)}, pytest_failures={pytest_result.get('failures', 0)}")
+        sm.save(state)  # SCAN checkpoint
+    else:
+        print("[SCAN] resume: スキップ（完了済み）")
 
     # ── SENSE ──
-    state["phase"] = "SENSE"
-    candidates = generate_candidates(state["scan_results"])
-    state["candidates"] = candidates
-    sm.save_candidates(candidates, date_str)
-    print(f"[SENSE] タスク候補: {len(candidates)}件")
+    if not (resume_phase and _should_skip_phase(resume_phase, "SENSE")):
+        state["phase"] = "SENSE"
+        candidates = generate_candidates(state["scan_results"])
+        state["candidates"] = candidates
+        sm.save_candidates(candidates, date_str)
+        print(f"[SENSE] タスク候補: {len(candidates)}件")
+        sm.save(state)  # SENSE checkpoint
+    else:
+        print("[SENSE] resume: スキップ（完了済み）")
+        candidates = state.get("candidates", [])
 
     # ── SELECT ──
-    state["phase"] = "SELECT"
-    selected = select_task(candidates, state.get("paused_tasks", []))
-    state["selected_task"] = selected
-    if selected is None:
-        print("[SELECT] 対処可能なタスクがありません。サイクル完了。")
-        state["status"] = "COMPLETED"
-        state["completed_at"] = datetime.now(JST).isoformat()
-        state["phase"] = "CHECKPOINT"
-        sm.save(state)
-        # 候補なし早期終了でも report.json を出力
-        report = {
-            "cycle_id": state["cycle_id"],
-            "status": state["status"],
-            "reason": "no_candidates",
-            "scan_summary": {
-                "lint_errors": state["scan_results"].get("workflow_lint_errors", 0),
-                "pytest_failures": state["scan_results"].get("pytest_failures", 0),
-            },
-            "candidates_count": 0,
-            "selected_task": None,
-            "outcome": "SUCCESS",
-            "paused_tasks": state.get("paused_tasks", []),
-        }
-        report_path = sm.save_report(report, date_str)
-        _record_ki("SUCCESS", cycle_id=state["cycle_id"], task_id="none", note="no_candidates")
-        print(f"[CHECKPOINT] state保存完了: {sm.state_path}")
-        print(f"[CHECKPOINT] レポート出力: {report_path}")
-        return 0
-    print(f"[SELECT] タスク選択: {selected['task_id']} — {selected['title']}")
+    if not (resume_phase and _should_skip_phase(resume_phase, "SELECT")):
+        state["phase"] = "SELECT"
+        selected = select_task(candidates, state.get("paused_tasks", []))
+        state["selected_task"] = selected
+        if selected is None:
+            print("[SELECT] 対処可能なタスクがありません。サイクル完了。")
+            state["status"] = "COMPLETED"
+            state["completed_at"] = datetime.now(JST).isoformat()
+            state["phase"] = "CHECKPOINT"
+            sm.save(state)
+            # 候補なし早期終了でも report.json を出力
+            report = {
+                "cycle_id": state["cycle_id"],
+                "status": state["status"],
+                "reason": "no_candidates",
+                "scan_summary": {
+                    "lint_errors": state["scan_results"].get("workflow_lint_errors", 0),
+                    "pytest_failures": state["scan_results"].get("pytest_failures", 0),
+                },
+                "candidates_count": 0,
+                "selected_task": None,
+                "outcome": "SUCCESS",
+                "paused_tasks": state.get("paused_tasks", []),
+            }
+            report_path = sm.save_report(report, date_str)
+            _record_ki("SUCCESS", cycle_id=state["cycle_id"], task_id="none", note="no_candidates")
+            print(f"[CHECKPOINT] state保存完了: {sm.state_path}")
+            print(f"[CHECKPOINT] レポート出力: {report_path}")
+            return 0
+        print(f"[SELECT] タスク選択: {selected['task_id']} — {selected['title']}")
+        sm.save(state)  # SELECT checkpoint
+    else:
+        print("[SELECT] resume: スキップ（完了済み）")
+        selected = state.get("selected_task")
 
     # ── EXECUTE ──
-    state["phase"] = "EXECUTE"
-    if args.dry_run:
-        print("[EXECUTE] dry-runモード: スキップ")
-        state["execution_result"] = {"dry_run": True, "skipped": True}
+    if not (resume_phase and _should_skip_phase(resume_phase, "EXECUTE")):
+        state["phase"] = "EXECUTE"
+        if args.dry_run:
+            print("[EXECUTE] dry-runモード: スキップ")
+            state["execution_result"] = {"dry_run": True, "skipped": True}
+        else:
+            # MVP: 実行はまだ未実装（将来拡張ポイント）
+            print("[EXECUTE] MVP: 自動実行は未実装。タスクレポートのみ出力します。")
+            state["execution_result"] = {"implemented": False, "note": "MVP — 手動対応が必要"}
+        sm.save(state)  # EXECUTE checkpoint
     else:
-        # MVP: 実行はまだ未実装（将来拡張ポイント）
-        print("[EXECUTE] MVP: 自動実行は未実装。タスクレポートのみ出力します。")
-        state["execution_result"] = {"implemented": False, "note": "MVP — 手動対応が必要"}
+        print("[EXECUTE] resume: スキップ（完了済み）")
 
     # ── VERIFY ──
-    state["phase"] = "VERIFY"
-    if args.dry_run:
-        print("[VERIFY] dry-runモード: スキップ")
-        state["verification_result"] = {"dry_run": True, "skipped": True}
+    if not (resume_phase and _should_skip_phase(resume_phase, "VERIFY")):
+        state["phase"] = "VERIFY"
+        if args.dry_run:
+            print("[VERIFY] dry-runモード: スキップ")
+            state["verification_result"] = {"dry_run": True, "skipped": True}
+        else:
+            print("[VERIFY] MVP: 自動検証は未実装。")
+            state["verification_result"] = {"implemented": False}
+        sm.save(state)  # VERIFY checkpoint
     else:
-        print("[VERIFY] MVP: 自動検証は未実装。")
-        state["verification_result"] = {"implemented": False}
+        print("[VERIFY] resume: スキップ（完了済み）")
 
     # ── LEARN ──
-    state["phase"] = "LEARN"
-    outcome = "SUCCESS" if args.dry_run else "PARTIAL"
-    _record_ki(
-        outcome=outcome,
-        cycle_id=state["cycle_id"],
-        task_id=selected["task_id"],
-        note="dry_run" if args.dry_run else "mvp_partial",
-    )
-    print(f"[LEARN] KI Learning記録: outcome={outcome}")
+    if not (resume_phase and _should_skip_phase(resume_phase, "LEARN")):
+        state["phase"] = "LEARN"
+        outcome = "SUCCESS" if args.dry_run else "PARTIAL"
+        _record_ki(
+            outcome=outcome,
+            cycle_id=state["cycle_id"],
+            task_id=selected["task_id"] if selected else "none",
+            note="dry_run" if args.dry_run else "mvp_partial",
+        )
+        print(f"[LEARN] KI Learning記録: outcome={outcome}")
+        sm.save(state)  # LEARN checkpoint
+    else:
+        print("[LEARN] resume: スキップ（完了済み）")
+        outcome = "SUCCESS" if args.dry_run else "PARTIAL"
 
     # ── CHECKPOINT ──
     state["phase"] = "CHECKPOINT"

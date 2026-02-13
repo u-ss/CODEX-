@@ -1,9 +1,9 @@
 ---
-name: AGI Kernel v0.1.0
+name: AGI Kernel v0.2.0
 description: 自己改善ループ（AGIカーネル）— リポジトリスキャン・タスク生成・状態管理・学習記録
 ---
 
-# AGI Kernel SKILL v0.1.0
+# AGI Kernel SKILL v0.2.0
 
 **リポジトリの健全性を定期スキャンし、改善タスクを生成・実行・検証・記録する自己改善ループの技術仕様。**
 
@@ -56,7 +56,7 @@ BOOT → SCAN → SENSE → SELECT → EXECUTE → VERIFY → LEARN → CHECKPOI
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "0.2.0",
   "cycle_id": "20260214_005300",
   "phase": "CHECKPOINT",
   "status": "COMPLETED",
@@ -150,10 +150,12 @@ BOOT → SCAN → SENSE → SELECT → EXECUTE → VERIFY → LEARN → CHECKPOI
 
 | パス | 内容 | Git追跡 |
 |:-----|:-----|:-------:|
-| `_outputs/agi_kernel/state.json` | 最新状態 | ❌ |
-| `_outputs/agi_kernel/{YYYYMMDD}/candidates.json` | タスク候補 | ❌ |
-| `_outputs/agi_kernel/{YYYYMMDD}/report.json` | サイクルレポート | ❌ |
-| `_logs/autonomy/agi_kernel/` | WorkflowLoggerログ | ❌ |
+| `_outputs/agi_kernel/state.json` | 最新状態 | ✖ |
+| `_outputs/agi_kernel/state.json.bak` | 前回保存のバックアップ | ✖ |
+| `_outputs/agi_kernel/lock` | 多重起動防止ロック | ✖ |
+| `_outputs/agi_kernel/{YYYYMMDD}/candidates.json` | タスク候補 | ✖ |
+| `_outputs/agi_kernel/{YYYYMMDD}/report.json` | サイクルレポート | ✖ |
+| `_logs/autonomy/agi_kernel/` | WorkflowLoggerログ | ✖ |
 
 ---
 
@@ -199,3 +201,11 @@ from workflow_logging_hook import run_logged_main
 - **dry-runデフォルト推奨**: 破壊的操作は禁止
 - **state保存必須**: 中断しても再開可能
 - **Language**: 日本語
+
+### v0.2.0 追加ルール
+
+- **Atomic Write**: state.jsonはtmp+fsync+os.replaceで保存
+- **Backup/復旧**: save前に.bakを作成、load時に.bakフォールバック
+- **Lockfile**: `_outputs/agi_kernel/lock` で多重起動防止（TTL=600sでstale回収）
+- **Phase Checkpoint**: 各Phase完了時にstate保存、--resumeでそのphaseから再開
+

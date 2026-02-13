@@ -1,9 +1,9 @@
 ---
-name: AGI Kernel v0.1.0
+name: AGI Kernel v0.2.0
 description: 自己改善ループ（AGIカーネル）— リポジトリスキャン・タスク生成・状態管理・学習記録
 ---
 
-# AGI Kernel v0.1.0 (`/agi_kernel`)
+# AGI Kernel v0.2.0 (`/agi_kernel`)
 
 **リポジトリの健全性をスキャンし、改善タスクを1つずつ処理する自己改善ループ。**
 状態を保存し、中断しても再開できる。
@@ -74,6 +74,8 @@ python "エージェント/AGIカーネル/scripts/agi_kernel.py" --resume --dry
 | パス | 内容 |
 |:-----|:-----|
 | `_outputs/agi_kernel/state.json` | 最新状態 |
+| `_outputs/agi_kernel/state.json.bak` | バックアップ |
+| `_outputs/agi_kernel/lock` | 多重起動防止ロック |
 | `_outputs/agi_kernel/{YYYYMMDD}/candidates.json` | タスク候補 |
 | `_outputs/agi_kernel/{YYYYMMDD}/report.json` | サイクルレポート |
 
@@ -131,8 +133,10 @@ python "エージェント/AGIカーネル/scripts/agi_kernel.py" --resume --dry
 
 ### Phase 8: CHECKPOINT
 ```
-□ state.json を保存
+□ state.json を atomic write で保存（tmp+fsync+replace）
+□ state.json.bak を作成
 □ report.json を出力
+□ lockfile を解放
 □ WorkflowLogger 終了
 ```
 
