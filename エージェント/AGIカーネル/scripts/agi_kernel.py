@@ -18,11 +18,12 @@ import re
 from abc import ABC, abstractmethod
 import textwrap
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 
 import argparse
 import json
 import os
+import random
 
 # .env 自動読み込み（python-dotenvがあれば）
 try:
@@ -34,6 +35,7 @@ try:
 except ImportError:
     pass  # dotenv 未インストールでも動作可能
 
+import logging
 import shutil
 import subprocess
 import sys
@@ -41,6 +43,34 @@ import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Optional
+
+# ── ロガー初期化 ──
+logger = logging.getLogger("agi_kernel")
+
+
+class _JsonFormatter(logging.Formatter):
+    """JSON構造化ログフォーマッタ。"""
+    def format(self, record: logging.LogRecord) -> str:
+        entry = {
+            "ts": self.formatTime(record),
+            "level": record.levelname,
+            "phase": getattr(record, "phase", ""),
+            "msg": record.getMessage(),
+        }
+        return json.dumps(entry, ensure_ascii=False)
+
+
+def _setup_logging(*, json_mode: bool = False, level: int = logging.INFO) -> None:
+    """ロギング初期設定。json_mode=True でJSON構造化出力。"""
+    handler = logging.StreamHandler(sys.stdout)
+    if json_mode:
+        handler.setFormatter(_JsonFormatter())
+    else:
+        handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.handlers.clear()
+    logger.addHandler(handler)
+    logger.setLevel(level)
+    logger.propagate = False
 
 # タイムゾーン: JST
 JST = timezone(timedelta(hours=9))
@@ -85,6 +115,16 @@ MAX_TASK_FAILURES = 3
 MAX_PATCH_FILES = 5          # 1回のパッチで変更可能な最大ファイル数
 MAX_DIFF_LINES = 200         # 1回のパッチの最大diff行数
 MAX_LLM_RETRIES = 3          # LLM出力バリデーション失敗時の最大リトライ
+LLM_RETRY_BASE_DELAY_SECONDS = 1.0  # LLM再試行の初期待機秒
+LLM_RETRY_MAX_DELAY_SECONDS = 8.0   # LLM再試行の最大待機秒
+LLM_RETRY_JITTER_SECONDS = 0.3      # 同時再試行回避のジッター
+
+# ── コスト推定定数（USD / 1M tokens, 2026-02時点） ──
+_COST_PER_1M: dict[str, dict[str, float]] = {
+    "gemini-2.5-flash": {"input": 0.15, "output": 0.60},
+    "gemini-2.5-pro": {"input": 1.25, "output": 5.00},
+}
+
 COMMAND_ALLOWLIST = [         # VERIFY で実行を許可するコマンド
     [sys.executable, "-m", "pytest", "-q", "--tb=short", "--color=no"],
     [sys.executable, "tools/workflow_lint.py"],
@@ -568,8 +608,13 @@ class Scanner:
     def __init__(self, workspace: Path):
         self.workspace = workspace
 
-    def run_workflow_lint(self) -> dict[str, Any]:
-        """workflow_lintを実行し結果を返す。"""
+    def run_workflow_lint(self, severity_filter: tuple[str, ...] = ("[ERROR]",)) -> dict[str, Any]:
+        """workflow_lintを実行し結果を返す。
+
+        Args:
+            severity_filter: 取り込む重要度レベル（デフォルト: ERROR のみ）。
+                例: ("[ERROR]", "[CAUTION]") で CAUTION も対象にする。
+        """
         lint_script = self.workspace / "tools" / "workflow_lint.py"
         if not lint_script.exists():
             return {"available": False, "errors": 0, "findings": []}
@@ -580,16 +625,17 @@ class Scanner:
                 capture_output=True, text=True, timeout=60,
                 cwd=str(self.workspace),
             )
-            # [ERROR] 行を抽出
-            errors = [
+            # severity_filter に合致する行を抽出
+            findings = [
                 line.strip() for line in result.stdout.splitlines()
-                if line.strip().startswith("[ERROR]")
+                if any(line.strip().startswith(sev) for sev in severity_filter)
             ]
             return {
                 "available": True,
-                "errors": len(errors),
-                "findings": errors[:20],  # 上限20件
+                "errors": len(findings),
+                "findings": findings[:20],  # 上限20件
                 "exit_code": result.returncode,
+                "severity_filter": list(severity_filter),
             }
         except (subprocess.TimeoutExpired, OSError) as e:
             return {"available": True, "errors": -1, "findings": [], "error": str(e)}
@@ -809,51 +855,155 @@ def record_failure(state: dict, task_id: str, category: str, error: str) -> bool
 # KI Learning 記録
 # ============================================================
 
-def _record_ki(outcome: str, **kwargs) -> None:
-    """KI Learningに記録する（ライブラリ不在でも落ちない）。"""
+def _record_ki(outcome: str, *, metadata: Optional[dict] = None, **kwargs) -> None:
+    """構造化KI Learning記録。
+
+    Args:
+        outcome: SUCCESS / FAILURE / PARTIAL
+        metadata: 構造化データ（failure_class, diff_summary, verification_result等）
+        **kwargs: report_action_outcomeに渡す追加引数
+    """
     if not _HAS_KI:
         return
     try:
+        extra = {}
+        if metadata:
+            extra["metadata"] = json.dumps(metadata, ensure_ascii=False, default=str)
         report_action_outcome(
             agent="/agi_kernel",
             intent_class="agi_kernel_cycle",
             outcome=outcome,
+            **extra,
             **kwargs,
         )
     except Exception:
         pass  # ライブラリ不在/エラーでも落ちない
 
 
+def _send_webhook(url: str, payload: dict) -> None:
+    """サイクル結果をWebhook（Discord/Slack互換）で通知する。"""
+    if not url:
+        return
+    try:
+        import urllib.request
+        data = json.dumps({"content": payload.get("summary", ""), "embeds": [{"title": "AGI Kernel", "description": json.dumps(payload, ensure_ascii=False, indent=2)[:2000]}]}, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+        urllib.request.urlopen(req, timeout=10)
+        logger.info("[WEBHOOK] 通知送信成功")
+    except Exception as e:
+        logger.warning(f"[WEBHOOK] 通知失敗: {e}")
+
+
 # ============================================================
 # Gemini SDK 遅延インポート
 # ============================================================
 
-def _get_genai():
-    """google.generativeai を遅延importする（未インストールでも起動可能）。"""
+class _GeminiClientCompat:
+    """google-genai / google-generativeai の互換ラッパー。"""
+
+    def __init__(self, backend: str, client: Any):
+        self.backend = backend
+        self.client = client
+
+    def generate_content(self, model_name: str, prompt: str):
+        if self.backend == "google-genai":
+            return self.client.models.generate_content(model=model_name, contents=prompt)
+        model = self.client.GenerativeModel(model_name)
+        return model.generate_content(prompt)
+
+
+def _get_genai_client() -> _GeminiClientCompat:
+    """Gemini SDKを遅延importする。google-genai優先、旧SDKへフォールバック。"""
+    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("環境変数 GOOGLE_API_KEY / GEMINI_API_KEY が未設定です")
+
     try:
-        import google.generativeai as genai
-        import warnings
-        warnings.filterwarnings("ignore", category=FutureWarning)
-        # GOOGLE_API_KEY または GEMINI_API_KEY を使用（互換）
-        api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY", "")
-        if not api_key:
-            raise RuntimeError("環境変数 GOOGLE_API_KEY / GEMINI_API_KEY が未設定です")
-        genai.configure(api_key=api_key)
-        return genai
+        # 新SDK (推奨)
+        from google import genai as genai_sdk  # type: ignore
+        client = genai_sdk.Client(api_key=api_key)
+        return _GeminiClientCompat("google-genai", client)
     except ImportError:
-        raise RuntimeError("google-generativeai がインストールされていません")
+        pass
+
+    try:
+        # 旧SDK (互換フォールバック)
+        import warnings
+        import google.generativeai as legacy_genai  # type: ignore
+
+        warnings.filterwarnings(
+            "ignore", category=FutureWarning, module=r"google\.generativeai"
+        )
+        legacy_genai.configure(api_key=api_key)
+        logger.warning("[SDK] google-generativeai（旧SDK）を使用中。google-genai への移行を推奨します")
+        return _GeminiClientCompat("google-generativeai", legacy_genai)
+    except ImportError as exc:
+        raise RuntimeError("google-genai / google-generativeai がインストールされていません") from exc
 
 
-def _log_token_usage(response, model_name: str) -> None:
-    """トークン消費をログ出力する。"""
+def _log_token_usage(response, model_name: str, state: Optional[dict] = None) -> dict[str, Any]:
+    """トークン消費をログ出力し、stateに累積する。コスト推定も計算。"""
+    usage: dict[str, Any] = {"prompt": 0, "output": 0, "total": 0, "estimated_cost_usd": 0.0}
     try:
         meta = response.usage_metadata
-        prompt_tokens = getattr(meta, "prompt_token_count", 0)
-        output_tokens = getattr(meta, "candidates_token_count", 0)
-        total = getattr(meta, "total_token_count", 0)
-        print(f"[TOKEN] model={model_name} input={prompt_tokens} output={output_tokens} total={total}")
+        usage["prompt"] = getattr(meta, "prompt_token_count", 0) or 0
+        usage["output"] = getattr(meta, "candidates_token_count", 0) or 0
+        usage["total"] = getattr(meta, "total_token_count", 0) or 0
+        # コスト推定
+        cost_rates = _COST_PER_1M.get(model_name, {"input": 0.15, "output": 0.60})
+        usage["estimated_cost_usd"] = round(
+            usage["prompt"] * cost_rates["input"] / 1_000_000
+            + usage["output"] * cost_rates["output"] / 1_000_000, 6
+        )
+        logger.info(f"[TOKEN] model={model_name} input={usage['prompt']} output={usage['output']} total={usage['total']} cost=${usage['estimated_cost_usd']}")
     except (AttributeError, TypeError):
-        print("[TOKEN] トークン情報取得不可")
+        logger.info("[TOKEN] トークン情報取得不可")
+
+    # state に累積
+    if state is not None:
+        tu = state.setdefault("token_usage", {"prompt": 0, "output": 0, "total": 0, "estimated_cost_usd": 0.0})
+        tu["prompt"] += usage["prompt"]
+        tu["output"] += usage["output"]
+        tu["total"] += usage["total"]
+        tu["estimated_cost_usd"] = round(tu["estimated_cost_usd"] + usage["estimated_cost_usd"], 6)
+    return usage
+
+
+def _extract_response_text(response: Any) -> str:
+    """Geminiレスポンスからテキストを抽出する。"""
+    text = getattr(response, "text", None)
+    if isinstance(text, str) and text.strip():
+        return text
+
+    # 互換: candidates[].content.parts[].text
+    candidates = getattr(response, "candidates", None)
+    if isinstance(candidates, list):
+        for candidate in candidates:
+            content = getattr(candidate, "content", None)
+            parts = getattr(content, "parts", None) if content is not None else None
+            if isinstance(parts, list):
+                for part in parts:
+                    part_text = getattr(part, "text", None)
+                    if isinstance(part_text, str) and part_text.strip():
+                        return part_text
+
+    raise ValueError("LLMレスポンスに有効なテキストがありません")
+
+
+def _retry_delay_seconds(attempt: int) -> float:
+    """指数バックオフ + ジッターで待機秒を計算する。"""
+    base = LLM_RETRY_BASE_DELAY_SECONDS * (2 ** attempt)
+    jitter = random.uniform(0.0, LLM_RETRY_JITTER_SECONDS)
+    return min(LLM_RETRY_MAX_DELAY_SECONDS, base) + jitter
+
+
+def _sleep_before_retry(attempt: int, total_attempts: int, model_name: str) -> None:
+    """次のリトライまで待機する。最終試行では待機しない。"""
+    if attempt >= total_attempts - 1:
+        return
+    delay = _retry_delay_seconds(attempt)
+    print(f"[EXECUTE] リトライ待機 {delay:.2f}s (model={model_name})")
+    time.sleep(delay)
 
 
 # ============================================================
@@ -926,7 +1076,8 @@ class GeminiExecutor(Executor):
 
     def generate_patch(self, task: dict, context: str, workspace: Path) -> dict:
         """Gemini API でパッチを生成し、バリデーション済dictを返す。"""
-        genai = _get_genai()
+        client = _get_genai_client()
+        print(f"[EXECUTE] Gemini SDK backend={client.backend}")
 
         prompt = _PATCH_PROMPT_TEMPLATE.format(
             title=task.get("title", ""),
@@ -938,11 +1089,10 @@ class GeminiExecutor(Executor):
 
         # フェーズ1: 通常モデルで試行
         last_error = ""
-        model = genai.GenerativeModel(self.model_name)
         for attempt in range(MAX_LLM_RETRIES):
             try:
-                response = model.generate_content(prompt)
-                raw = response.text
+                response = client.generate_content(self.model_name, prompt)
+                raw = _extract_response_text(response)
                 # トークン消費ログ
                 _log_token_usage(response, self.model_name)
                 patch = _parse_patch_json(raw)
@@ -951,20 +1101,21 @@ class GeminiExecutor(Executor):
             except (json.JSONDecodeError, ValueError, KeyError) as e:
                 last_error = str(e)
                 print(f"[EXECUTE] LLMバリデーション失敗 (attempt {attempt+1}/{MAX_LLM_RETRIES}): {e}")
+                _sleep_before_retry(attempt, MAX_LLM_RETRIES, self.model_name)
                 continue
             except Exception as e:
                 last_error = str(e)
                 print(f"[EXECUTE] LLM呼び出しエラー (attempt {attempt+1}/{MAX_LLM_RETRIES}): {e}")
+                _sleep_before_retry(attempt, MAX_LLM_RETRIES, self.model_name)
                 continue
 
         # フェーズ2: 強力モデルでフォールバック
         if self.strong_model_name != self.model_name:
             print(f"[EXECUTE] → 強力モデル({self.strong_model_name})でフォールバック...")
-            strong_model = genai.GenerativeModel(self.strong_model_name)
             for attempt in range(MAX_LLM_RETRIES):
                 try:
-                    response = strong_model.generate_content(prompt)
-                    raw = response.text
+                    response = client.generate_content(self.strong_model_name, prompt)
+                    raw = _extract_response_text(response)
                     _log_token_usage(response, self.strong_model_name)
                     patch = _parse_patch_json(raw)
                     _validate_patch_result(patch, workspace)
@@ -972,28 +1123,85 @@ class GeminiExecutor(Executor):
                 except (json.JSONDecodeError, ValueError, KeyError) as e:
                     last_error = str(e)
                     print(f"[EXECUTE] 強力モデルバリデーション失敗 (attempt {attempt+1}/{MAX_LLM_RETRIES}): {e}")
+                    _sleep_before_retry(attempt, MAX_LLM_RETRIES, self.strong_model_name)
                     continue
                 except Exception as e:
                     last_error = str(e)
                     print(f"[EXECUTE] 強力モデルエラー (attempt {attempt+1}/{MAX_LLM_RETRIES}): {e}")
+                    _sleep_before_retry(attempt, MAX_LLM_RETRIES, self.strong_model_name)
                     continue
 
         raise RuntimeError(f"LLMパッチ生成に失敗: {last_error}")
 
 
+def _collect_json_candidates(raw: str) -> list[str]:
+    """LLM出力からJSON候補文字列を順序付きで収集する。"""
+    text = raw.strip()
+    if not text:
+        return []
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _append(candidate: str) -> None:
+        normalized = candidate.strip()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            candidates.append(normalized)
+
+    # 1) fenced code block
+    for m in re.finditer(r'```(?:json)?\s*\n(.*?)\n```', text, re.DOTALL):
+        _append(m.group(1))
+
+    # 2) 全体
+    _append(text)
+
+    # 3) 中括弧バランスの取れた部分文字列を走査
+    depth = 0
+    start = -1
+    in_string = False
+    escaped = False
+    for idx, ch in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            if depth == 0:
+                start = idx
+            depth += 1
+            continue
+        if ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start >= 0:
+                _append(text[start:idx + 1])
+                start = -1
+
+    return candidates
+
+
 def _parse_patch_json(raw: str) -> dict:
     """LLM出力からJSON部分を抽出してパースする。"""
-    # ```json ... ``` ブロックを探す
-    m = re.search(r'```(?:json)?\s*\n(.*?)\n```', raw, re.DOTALL)
-    if m:
-        return json.loads(m.group(1))
-    # ブロックなしの場合、全体をJSONとしてパース
-    # 先頭/末尾の非JSONテキストを除去
-    stripped = raw.strip()
-    start = stripped.find('{')
-    end = stripped.rfind('}') + 1
-    if start >= 0 and end > start:
-        return json.loads(stripped[start:end])
+    last_error: Optional[json.JSONDecodeError] = None
+    for candidate in _collect_json_candidates(raw):
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError as e:
+            last_error = e
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+
+    if last_error is not None:
+        raise json.JSONDecodeError("Valid JSON object not found in LLM output", raw, 0)
     raise json.JSONDecodeError("JSON not found in LLM output", raw, 0)
 
 
@@ -1459,7 +1667,10 @@ def _run_cycle_inner(
         state["phase"] = "SCAN"
         print("[SCAN] リポジトリスキャン中...")
         scanner = Scanner(workspace)
-        lint_result = scanner.run_workflow_lint()
+        # v0.6.0: --lint-severity 対応
+        sev_raw = getattr(args, "lint_severity", "error")
+        sev_filter = tuple(f"[{s.strip().upper()}]" for s in sev_raw.split(","))
+        lint_result = scanner.run_workflow_lint(severity_filter=sev_filter)
         pytest_result = scanner.run_pytest()
         _lint_errors = max(0, lint_result.get("errors", 0))
         _pytest_errors = max(0, pytest_result.get("errors_count", 0))
@@ -1609,6 +1820,28 @@ def _run_cycle_inner(
                     backup_map = _backup_targets(patch, workspace, backup_dir)
                     print(f"[EXECUTE] バックアップ完了: {backup_dir}")
 
+                    # v0.6.0: --approve ゲート
+                    if getattr(args, "approve", False):
+                        print("="*60)
+                        print("[APPROVE] パッチ内容:")
+                        for f in patch["files"]:
+                            print(f"  {f.get('action', 'modify')}: {f['path']}")
+                        print(f"  説明: {patch.get('explanation', '')[:300]}")
+                        print("="*60)
+                        answer = input("[APPROVE] 適用しますか? (y/n): ").strip().lower()
+                        if answer != "y":
+                            print("[APPROVE] ユーザーが拒否。スキップ。")
+                            state["execution_result"] = {"success": False, "error": "user_rejected"}
+                            state["last_completed_phase"] = "EXECUTE"
+                            sm.save(state)
+                            modified_paths = []
+                            # VERIFYもスキップしてLEARNへ
+                            resume_phase = "EXECUTE"  # VERIFYをスキップさせる
+                            state["verification_result"] = {"success": False, "skipped": True}
+                            state["last_completed_phase"] = "VERIFY"
+                            sm.save(state)
+                            # LEARN/CHECKPOINTへ落ちる
+
                     # パッチ適用
                     modified_paths = _apply_patch(patch, workspace)
                     print(f"[EXECUTE] パッチ適用完了: {[str(p.relative_to(workspace)) for p in modified_paths]}")
@@ -1719,10 +1952,13 @@ def _run_cycle_inner(
         print("[VERIFY] resume: スキップ（完了済み）")
 
     # ── LEARN ──
+    paused_now = False
     if not (resume_phase and _should_skip_phase(resume_phase, "LEARN")):
         state["phase"] = "LEARN"
 
-        # outcome 判定
+        # outcome 判定（v0.6.0: メタデータ用変数を事前初期化）
+        category = ""
+        error_msg = ""
         exec_result = state.get("execution_result", {})
         verify_result = state.get("verification_result", {})
         if args.dry_run:
@@ -1750,6 +1986,12 @@ def _run_cycle_inner(
             cycle_id=state["cycle_id"],
             task_id=selected["task_id"] if selected else "none",
             note=note,
+            metadata={
+                "failure_class": category if outcome == "FAILURE" else None,
+                "error_summary": (error_msg[:200] if outcome == "FAILURE" else None),
+                "verification_success": verify_result.get("success", None),
+                "files_modified": exec_result.get("files_modified", 0),
+            },
         )
         print(f"[LEARN] KI Learning記録: outcome={outcome}, note={note}")
         state["last_completed_phase"] = "LEARN"
@@ -1759,14 +2001,16 @@ def _run_cycle_inner(
         outcome = state.get("execution_result", {}).get("success", False) and \
                   state.get("verification_result", {}).get("success", False)
         outcome = "SUCCESS" if outcome else "PARTIAL"
+        if selected and selected.get("task_id") in state.get("paused_tasks", []):
+            paused_now = True
 
     # ── CHECKPOINT ──
     state["phase"] = "CHECKPOINT"
     state["last_completed_phase"] = "CHECKPOINT"
     state["completed_at"] = datetime.now(JST).isoformat()
 
-    # v0.5.1: paused_now 判定をreport生成前に実行し、statusを正確に反映
-    paused_now_flag = locals().get("paused_now", False)
+    # v0.5.2: paused_now は locals() 参照せず明示変数で管理
+    paused_now_flag = paused_now
     if paused_now_flag:
         state["status"] = "PAUSED"
         print(f"[CHECKPOINT] ⚠️ タスク {selected['task_id']} が {MAX_TASK_FAILURES}回失敗 → PAUSED停止")
@@ -1792,10 +2036,22 @@ def _run_cycle_inner(
         "selected_task": selected,
         "outcome": outcome,
         "paused_tasks": state.get("paused_tasks", []),
+        "token_usage": state.get("token_usage", {}),
     }
     report_path = sm.save_report(report, date_str, state["cycle_id"])
     print(f"[CHECKPOINT] state保存完了: {sm.state_path}")
     print(f"[CHECKPOINT] レポート出力: {report_path}")
+
+    # v0.6.0: Webhook通知
+    webhook_url = getattr(args, "webhook_url", None)
+    if webhook_url:
+        _send_webhook(webhook_url, {
+            "summary": f"AGI Kernel: cycle={state['cycle_id']} status={state['status']} outcome={outcome}",
+            "cycle_id": state["cycle_id"],
+            "status": state["status"],
+            "outcome": outcome,
+            "token_usage": state.get("token_usage", {}),
+        })
 
     return 1 if paused_now_flag else 0
 
@@ -1806,12 +2062,20 @@ def _run_cycle_inner(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="AGI Kernel — 自己改善ループ MVP",
+        description="AGI Kernel — 自己改善ループ",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--once", action="store_true",
-        help="1サイクルのみ実行して終了",
+        help="1サイクルのみ実行して終了（デフォルト動作）",
+    )
+    parser.add_argument(
+        "--loop", action="store_true",
+        help="常駐モード: --interval 秒ごとにサイクルを繰り返す",
+    )
+    parser.add_argument(
+        "--interval", type=int, default=300,
+        help="--loop 時のサイクル間隔（秒、デフォルト: 300）",
     )
     parser.add_argument(
         "--resume", action="store_true",
@@ -1826,6 +2090,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="VERIFY成功時に自動commitする（デフォルトOFF）",
     )
     parser.add_argument(
+        "--approve", action="store_true",
+        help="パッチ適用前に人間の承認を要求する",
+    )
+    parser.add_argument(
         "--workspace", type=str, default=str(_DEFAULT_WORKSPACE),
         help=f"ワークスペースルート（デフォルト: {_DEFAULT_WORKSPACE}）",
     )
@@ -1837,6 +2105,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--llm-strong-model", type=str, default=None, dest="llm_strong_model",
         help="強力LLMモデル（デフォルト: gemini-2.5-pro / env AGI_KERNEL_LLM_STRONG_MODEL）",
     )
+    parser.add_argument(
+        "--webhook-url", type=str, default=None, dest="webhook_url",
+        help="サイクル完了/PAUSED時にWebhook通知を送るURL（Discord/Slack互換）",
+    )
+    parser.add_argument(
+        "--lint-severity", type=str, default="error", dest="lint_severity",
+        help="workflow_lint取得レベル（カンマ区切り: error,caution,advisory,warning）",
+    )
+    parser.add_argument(
+        "--log-json", action="store_true", dest="log_json",
+        help="ログ出力をJSON構造化形式にする",
+    )
     return parser
 
 
@@ -1844,7 +2124,31 @@ def main() -> int:
     """エントリーポイント。"""
     parser = build_parser()
     args = parser.parse_args()
-    return run_cycle(args)
+
+    # ロギング初期化
+    _setup_logging(json_mode=getattr(args, "log_json", False))
+
+    if args.loop:
+        # 常駐モード
+        logger.info(f"[KERNEL] 常駐モード開始 (interval={args.interval}s)")
+        cycle_count = 0
+        try:
+            while True:
+                cycle_count += 1
+                logger.info(f"[KERNEL] === サイクル #{cycle_count} 開始 ===")
+                exit_code = run_cycle(args)
+                if exit_code != 0:
+                    logger.info(f"[KERNEL] サイクル #{cycle_count} が exit_code={exit_code} で終了。ループ停止。")
+                    return exit_code
+                logger.info(f"[KERNEL] サイクル #{cycle_count} 完了。{args.interval}秒後に次のサイクル...")
+                # resume フラグをリセットして新規サイクルへ
+                args.resume = False
+                time.sleep(args.interval)
+        except KeyboardInterrupt:
+            logger.info(f"[KERNEL] Ctrl+C を受信。{cycle_count}サイクル実行後に終了。")
+            return 0
+    else:
+        return run_cycle(args)
 
 
 if __name__ == "__main__":
@@ -1859,3 +2163,4 @@ if __name__ == "__main__":
         raise SystemExit(exit_code)
     else:
         raise SystemExit(main())
+

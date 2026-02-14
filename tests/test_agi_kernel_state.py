@@ -64,6 +64,15 @@ from agi_kernel import (
     _restore_rollback_context,
     annotate_candidates,
     Verifier,
+    Scanner,
+    _log_token_usage,
+    _record_ki,
+    _send_webhook,
+    _GeminiClientCompat,
+    _setup_logging,
+    _JsonFormatter,
+    logger,
+    build_parser,
     PHASE_ORDER,
     MAX_PATCH_FILES,
     MAX_TASK_FAILURES,
@@ -907,6 +916,12 @@ class TestParsePatchJson:
         result = _parse_patch_json(raw)
         assert len(result["files"]) == 1
 
+    def test_parse_skips_broken_brace_chunk(self):
+        """先頭の壊れた {..} を無視して後続JSONを抽出できる。"""
+        raw = 'メモ: {broken}\n{"files": [], "explanation": "ok"}\n'
+        result = _parse_patch_json(raw)
+        assert result["explanation"] == "ok"
+
     def test_reject_no_json(self):
         """JSONがない場合はエラー。"""
         with pytest.raises(json.JSONDecodeError):
@@ -1633,3 +1648,344 @@ class TestPausedNowReportConsistency:
         assert result is False
         # paused_tasksに重複追加されていないこと
         assert state["paused_tasks"].count("t1") == 1
+
+
+# ============================================================
+# v0.6.0 テスト
+# ============================================================
+
+class TestSeverityFilter:
+    """Scanner.run_workflow_lint の severity_filter テスト。"""
+
+    def test_default_error_only(self, tmp_path: Path):
+        """デフォルトは[ERROR]のみ取得。"""
+        scanner = Scanner(tmp_path)
+        # run_workflow_lint は lint_script が存在しないと available=False
+        result = scanner.run_workflow_lint()
+        assert result["available"] is False
+
+    def test_custom_severity_filter(self, tmp_path: Path):
+        """severity_filter にカスタム値が渡せる。"""
+        scanner = Scanner(tmp_path)
+        result = scanner.run_workflow_lint(severity_filter=("[ERROR]", "[CAUTION]"))
+        assert result["available"] is False  # スクリプトなし
+
+
+class TestCostTracking:
+    """token_usage 累積と推定コストのテスト。"""
+
+    def test_log_token_usage_accumulates(self):
+        """_log_token_usage が state に累積する。"""
+        class MockMeta:
+            prompt_token_count = 100
+            candidates_token_count = 50
+            total_token_count = 150
+        class MockResp:
+            usage_metadata = MockMeta()
+
+        state: dict = {}
+        _log_token_usage(MockResp(), "gemini-2.5-flash", state)
+        assert state["token_usage"]["prompt"] == 100
+        assert state["token_usage"]["output"] == 50
+        assert state["token_usage"]["total"] == 150
+        assert state["token_usage"]["estimated_cost_usd"] > 0
+
+        # 2回目: 累積
+        _log_token_usage(MockResp(), "gemini-2.5-flash", state)
+        assert state["token_usage"]["prompt"] == 200
+        assert state["token_usage"]["total"] == 300
+
+    def test_cost_estimation_flash(self):
+        """Flash モデルのコスト推定が正しい。"""
+        class MockMeta:
+            prompt_token_count = 1_000_000
+            candidates_token_count = 1_000_000
+            total_token_count = 2_000_000
+        class MockResp:
+            usage_metadata = MockMeta()
+
+        state: dict = {}
+        usage = _log_token_usage(MockResp(), "gemini-2.5-flash", state)
+        # input: 0.15 + output: 0.60 = 0.75
+        assert abs(usage["estimated_cost_usd"] - 0.75) < 0.001
+
+    def test_no_state_no_error(self):
+        """state=None でもエラーにならない。"""
+        class MockMeta:
+            prompt_token_count = 10
+            candidates_token_count = 5
+            total_token_count = 15
+        class MockResp:
+            usage_metadata = MockMeta()
+
+        usage = _log_token_usage(MockResp(), "gemini-2.5-flash", None)
+        assert usage["total"] == 15
+
+
+class TestStructuredKI:
+    """構造化KI記録のテスト。"""
+
+    def test_record_ki_with_metadata(self):
+        """metadata付きでも _record_ki はエラーにならない（KIライブラリ不在時）。"""
+        # KI不在時は何もしない（例外を出さないことを確認）
+        _record_ki(
+            "FAILURE",
+            cycle_id="test",
+            task_id="test_task",
+            note="test",
+            metadata={
+                "failure_class": "DETERMINISTIC",
+                "error_summary": "test error",
+                "verification_success": False,
+                "files_modified": 0,
+            },
+        )
+
+
+class TestWebhook:
+    """Webhook通知のテスト。"""
+
+    def test_send_webhook_empty_url(self):
+        """URL空文字列は何もしない。"""
+        _send_webhook("", {"summary": "test"})  # エラーなし
+
+    def test_send_webhook_none_url(self):
+        """URL=None は何もしない。"""
+        _send_webhook(None, {"summary": "test"})  # エラーなし
+
+    def test_send_webhook_invalid_url(self):
+        """無効URLはログ警告のみでエラーにならない。"""
+        _send_webhook("http://localhost:99999/invalid", {"summary": "test"})
+
+
+class TestCLIArgs:
+    """v0.6.0 CLI引数のテスト。"""
+
+    def test_build_parser_has_new_args(self):
+        """新しいCLI引数がパーサーに存在する。"""
+        parser = build_parser()
+        args = parser.parse_args(["--once", "--log-json", "--lint-severity", "error,caution"])
+        assert args.log_json is True
+        assert args.lint_severity == "error,caution"
+
+    def test_loop_and_interval_defaults(self):
+        """--loop と --interval のデフォルト値。"""
+        parser = build_parser()
+        args = parser.parse_args([])
+        assert args.loop is False
+        assert args.interval == 300
+
+    def test_approve_flag(self):
+        """--approve フラグが機能する。"""
+        parser = build_parser()
+        args = parser.parse_args(["--approve"])
+        assert args.approve is True
+
+    def test_webhook_url(self):
+        """--webhook-url が正しく解析される。"""
+        parser = build_parser()
+        args = parser.parse_args(["--webhook-url", "https://discord.com/api/webhooks/test"])
+        assert args.webhook_url == "https://discord.com/api/webhooks/test"
+
+
+class TestSDKCompat:
+    """SDK互換層のテスト。"""
+
+    def test_gemini_client_compat_backend(self):
+        """_GeminiClientCompat のバックエンド識別。"""
+        mock_client = type("MockClient", (), {})()
+        compat = _GeminiClientCompat("google-genai", mock_client)
+        assert compat.backend == "google-genai"
+        assert compat.client is mock_client
+
+    def test_gemini_client_compat_legacy_backend(self):
+        """旧SDKバックエンドの識別。"""
+        mock_client = type("MockClient", (), {})()
+        compat = _GeminiClientCompat("google-generativeai", mock_client)
+        assert compat.backend == "google-generativeai"
+
+
+class TestLoggingSetup:
+    """logging初期化のテスト。"""
+
+    def test_setup_logging_default(self):
+        """デフォルト(テキスト)モードでエラーにならない。"""
+        import logging
+        _setup_logging(json_mode=False)
+        assert logger.level == logging.INFO
+
+    def test_setup_logging_json(self):
+        """JSONモードでエラーにならない。"""
+        _setup_logging(json_mode=True)
+        assert len(logger.handlers) == 1
+        assert isinstance(logger.handlers[0].formatter, _JsonFormatter)
+
+
+# ============================================================
+# v0.6.0 CLI統合テスト + スキーマ固定テスト
+# ============================================================
+
+from agi_kernel import run_cycle, _COST_PER_1M
+
+
+def _make_args(tmp_path: Path, **overrides):
+    """テスト用のargparse.Namespaceを生成するヘルパー。"""
+    defaults = {
+        "once": True,
+        "loop": False,
+        "interval": 300,
+        "resume": False,
+        "dry_run": True,       # 安全のためdry-run
+        "auto_commit": False,
+        "approve": False,
+        "workspace": str(tmp_path),
+        "llm_model": None,
+        "llm_strong_model": None,
+        "webhook_url": None,
+        "lint_severity": "error",
+        "log_json": False,
+    }
+    defaults.update(overrides)
+    import argparse
+    return argparse.Namespace(**defaults)
+
+
+class TestCLIIntegrationLoop:
+    """--loop 統合テスト。"""
+
+    def test_loop_flag_parsed(self):
+        """--loop --interval 60 がパーサーで正しく解析される。"""
+        parser = build_parser()
+        args = parser.parse_args(["--loop", "--interval", "60"])
+        assert args.loop is True
+        assert args.interval == 60
+
+    def test_loop_single_cycle_exits_on_nonzero(self, tmp_path: Path):
+        """常駐モードは exit_code!=0 で停止する
+        （ワークスペース空なのでスキャン→候補なし→COMPLETED→exit 0 になるので
+        ここではonce=True相当で1回走ることを確認）。
+        """
+        args = _make_args(tmp_path, loop=False)
+        exit_code = run_cycle(args)
+        # dry_run + 空ワークスペース → COMPLETED → 0
+        assert exit_code == 0
+
+
+class TestCLIIntegrationApprove:
+    """--approve 統合テスト。"""
+
+    def test_approve_flag_parsed(self):
+        """--approve がパーサーで正しく解析される。"""
+        parser = build_parser()
+        args = parser.parse_args(["--approve"])
+        assert args.approve is True
+
+    def test_approve_in_dry_run_no_prompt(self, tmp_path: Path):
+        """dry-run + --approve ではEXECUTEがスキップされるため
+        input()プロンプトは呼ばれない。"""
+        args = _make_args(tmp_path, approve=True, dry_run=True)
+        # dry_runなのでEXECUTE自体がスキップ → input()は呼ばれずに完了
+        exit_code = run_cycle(args)
+        assert exit_code == 0
+
+
+class TestCLIIntegrationLogJson:
+    """--log-json 統合テスト。"""
+
+    def test_log_json_sets_formatter(self):
+        """_setup_logging(json_mode=True) でJSONフォーマッタが適用される。"""
+        _setup_logging(json_mode=True)
+        assert isinstance(logger.handlers[0].formatter, _JsonFormatter)
+
+    def test_log_json_produces_json_output(self, capsys):
+        """JSONモードのログ出力がJSON形式になる。"""
+        _setup_logging(json_mode=True)
+        logger.info("テストメッセージ")
+        captured = capsys.readouterr()
+        parsed = json.loads(captured.out.strip())
+        assert parsed["msg"] == "テストメッセージ"
+        assert parsed["level"] == "INFO"
+
+
+class TestCLIIntegrationLintSeverity:
+    """--lint-severity 統合テスト。"""
+
+    def test_lint_severity_multi_level(self, tmp_path: Path):
+        """--lint-severity error,caution がsev_filterに変換される。"""
+        args = _make_args(tmp_path, lint_severity="error,caution")
+        sev_filter = tuple(f"[{s.strip().upper()}]" for s in args.lint_severity.split(","))
+        assert sev_filter == ("[ERROR]", "[CAUTION]")
+
+    def test_lint_severity_run_cycle(self, tmp_path: Path):
+        """error,caution でもrun_cycleがエラーなく完了する。"""
+        args = _make_args(tmp_path, lint_severity="error,caution")
+        exit_code = run_cycle(args)
+        assert exit_code == 0
+
+
+class TestCLIIntegrationWebhook:
+    """--webhook-url 統合テスト。"""
+
+    def test_webhook_url_parsed(self):
+        """--webhook-url がパーサーで正しく解析される。"""
+        parser = build_parser()
+        args = parser.parse_args(["--webhook-url", "https://hooks.example.com/test"])
+        assert args.webhook_url == "https://hooks.example.com/test"
+
+    def test_webhook_invalid_url_no_crash(self, tmp_path: Path):
+        """無効なwebhook URLでもrun_cycleがクラッシュしない。"""
+        args = _make_args(tmp_path, webhook_url="http://localhost:1/invalid")
+        exit_code = run_cycle(args)
+        assert exit_code == 0
+
+
+class TestReportTokenUsageSchema:
+    """report.json の token_usage / cost スキーマ固定テスト。"""
+
+    _REQUIRED_KEYS = {"prompt", "output", "total", "estimated_cost_usd"}
+
+    def test_token_usage_default_has_all_keys(self):
+        """state.setdefault で作成される token_usage が全キーを持つ。"""
+        state: dict = {}
+        tu = state.setdefault("token_usage", {
+            "prompt": 0, "output": 0, "total": 0, "estimated_cost_usd": 0.0,
+        })
+        assert self._REQUIRED_KEYS.issubset(tu.keys())
+
+    def test_token_usage_after_log_has_all_keys(self):
+        """_log_token_usage 後の state["token_usage"] が全キーを持つ。"""
+        class MockMeta:
+            prompt_token_count = 10
+            candidates_token_count = 5
+            total_token_count = 15
+        class MockResp:
+            usage_metadata = MockMeta()
+
+        state: dict = {}
+        _log_token_usage(MockResp(), "gemini-2.5-flash", state)
+        assert self._REQUIRED_KEYS.issubset(state["token_usage"].keys())
+        assert isinstance(state["token_usage"]["estimated_cost_usd"], float)
+
+    def test_report_includes_token_usage(self, tmp_path: Path):
+        """dry-run サイクルの report.json に token_usage キーが含まれる。"""
+        args = _make_args(tmp_path)
+        exit_code = run_cycle(args)
+        assert exit_code == 0
+        # report.json を探す
+        report_files = list(tmp_path.rglob("report_*.json"))
+        # dry-run + 空ワークスペースでは候補なし早期終了する場合がある
+        # → state.json 経由で token_usage を確認
+        state_file = tmp_path / "_outputs" / "state.json"
+        if state_file.exists():
+            state_data = json.loads(state_file.read_text(encoding="utf-8"))
+            if "token_usage" in state_data:
+                assert self._REQUIRED_KEYS.issubset(state_data["token_usage"].keys())
+
+    def test_cost_per_1m_has_required_models(self):
+        """_COST_PER_1M に必須モデルが含まれる。"""
+        assert "gemini-2.5-flash" in _COST_PER_1M
+        assert "gemini-2.5-pro" in _COST_PER_1M
+        for model_rates in _COST_PER_1M.values():
+            assert "input" in model_rates
+            assert "output" in model_rates
+

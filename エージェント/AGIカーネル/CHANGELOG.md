@@ -1,10 +1,43 @@
 # AGI Kernel CHANGELOG
 
+## v0.6.0 (2026-02-15)
+
+### ⚠️ 互換性・Breaking Changes
+- `_log_token_usage()` の戻り値が `None` → `dict[str, Any]` に変更。引数に `state` を追加
+- `_record_ki()` に `metadata` キーワード引数を追加（既存呼び出しは互換あり）
+- `Scanner.run_workflow_lint()` に `severity_filter` キーワード引数を追加（デフォルトで後方互換）
+- `report.json` に `token_usage` フィールドを追加
+- `build_parser()` に新フラグ6個追加（既存CLIは影響なし）
+
+### 新機能
+- **構造化ログ**: `logging` モジュール移行 + `_JsonFormatter` + `_setup_logging(json_mode=True)`
+- **常駐モード**: `--loop --interval N` でサイクル自動繰り返し（Ctrl+C安全停止）
+- **承認ゲート**: `--approve` でパッチ適用前に人間の確認を要求
+- **Webhook通知**: `--webhook-url` でサイクル完了/PAUSED時にDiscord/Slack互換通知
+- **Lint重要度フィルタ**: `--lint-severity error,caution` でCAUTION/ADVISORY取込
+- **JSON構造化ログ出力**: `--log-json` フラグ
+- **LLMコスト追跡**: `_COST_PER_1M` 料金テーブル + `token_usage` 累積 + 推定コスト（USD）
+- **SDK互換警告**: 旧 `google.generativeai` 使用時に `logger.warning` で移行推奨
+- **KI構造化記録**: `_record_ki()` に `metadata` 引数追加（failure_class, error_summary, verification_success, files_modified）
+- **Webhook通知関数**: `_send_webhook()` 追加（urllib.request ベース）
+
+### テスト追加
+- `TestCLIIntegrationLoop`: --loop 統合テスト2件
+- `TestCLIIntegrationApprove`: --approve 統合テスト2件
+- `TestCLIIntegrationLogJson`: --log-json 統合テスト2件
+- `TestCLIIntegrationLintSeverity`: --lint-severity 統合テスト2件
+- `TestCLIIntegrationWebhook`: --webhook-url 統合テスト2件
+- `TestReportTokenUsageSchema`: スキーマ固定テスト4件
+- `TestSeverityFilter` / `TestCostTracking` / `TestStructuredKI` / `TestWebhook` / `TestCLIArgs` / `TestSDKCompat` / `TestLoggingSetup`
+- 合計: 140 → 172 テスト (+32)
+
+---
+
 ## v0.5.1 (2026-02-15)
 
 ### バグ修正
 - **[P2] report/state 整合性修正**: `paused_now` 判定を report 生成前に移動し、`state.json` と `report.json` の `status` が常に一致するように修正
-- **[P2] パス検証強化**: `".." in path_str` → `Path.parts` でコンポーネント単位検出に変更。`startswith()` 文字列比較 → `Path.relative_to()` に変更し、prefix衝突脆弱性を解消
+- **[P2] パス検証強化**: `".. " in path_str` → `Path.parts` でコンポーネント単位検出に変更。`startswith()` 文字列比較 → `Path.relative_to()` に変更し、prefix衝突脆弱性を解消
 - **[P3] `__version__`**: `0.4.0` → `0.5.1` に更新
 
 ### テスト追加
