@@ -18,7 +18,7 @@ import re
 from abc import ABC, abstractmethod
 import textwrap
 
-__version__ = "0.4.0"
+__version__ = "0.5.1"
 
 import argparse
 import json

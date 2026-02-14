@@ -1532,3 +1532,104 @@ class TestVerifierNodeid:
         assert "tests/test_a.py" in result["command"]
         assert "::" not in result["command"]
 
+
+# ────────────────────────────────────────
+# v0.5.1 回帰テスト（ChatGPT Pro指摘対応）
+# ────────────────────────────────────────
+
+class TestPathValidationBoundary:
+    """[P2] パス検証の境界ケーステスト。"""
+
+    def test_dotdot_in_component_rejected(self, tmp_path: Path):
+        """.. がパスコンポーネントにある場合は拒否。"""
+        patch = {
+            "files": [{"path": "../outside.py", "action": "create", "content": ""}],
+        }
+        with pytest.raises(ValueError, match="\\.\\."):
+            _validate_patch_result(patch, tmp_path)
+
+    def test_dotdot_in_middle_rejected(self, tmp_path: Path):
+        """中間に .. があるパスは拒否。"""
+        patch = {
+            "files": [{"path": "sub/../../../etc/passwd", "action": "create", "content": ""}],
+        }
+        with pytest.raises(ValueError, match="\\.\\."):
+            _validate_patch_result(patch, tmp_path)
+
+    def test_dotdot_in_filename_allowed(self, tmp_path: Path):
+        """ファイル名に .. が含まれる場合（foo..bar.py）は許可。"""
+        patch = {
+            "files": [{"path": "foo..bar.py", "action": "create", "content": ""}],
+        }
+        # 例外が出ないことを確認
+        _validate_patch_result(patch, tmp_path)
+
+    def test_absolute_path_rejected(self, tmp_path: Path):
+        """絶対パスはワークスペース外として拒否。"""
+        patch = {
+            "files": [{"path": "/etc/passwd", "action": "create", "content": ""}],
+        }
+        with pytest.raises(ValueError):
+            _validate_patch_result(patch, tmp_path)
+
+    def test_prefix_collision_rejected(self, tmp_path: Path):
+        """ワークスペース名のprefix衝突は拒否される。
+        例: workspace=/tmp/ws のとき /tmp/ws2/evil.py が通らないこと。
+        """
+        # tmp_path = /tmp/pytest-xxx/test_xxx
+        # sibling = /tmp/pytest-xxx/test_xxx2  (prefix衝突)
+        sibling = Path(str(tmp_path) + "2")
+        sibling.mkdir(exist_ok=True)
+        evil_file = sibling / "evil.py"
+        evil_file.write_text("hack", encoding="utf-8")
+        # relative_to で検証するので、resolve後にworkspace外と判定される
+        # ただし相対パスとして渡すにはシンボリックリンク等が必要。
+        # ここでは絶対パスで渡して拒否されることを確認。
+        patch = {
+            "files": [{"path": str(evil_file), "action": "modify", "content": "x"}],
+        }
+        with pytest.raises(ValueError):
+            _validate_patch_result(patch, tmp_path)
+
+    def test_normal_nested_path_allowed(self, tmp_path: Path):
+        """正常なネストパスは許可。"""
+        patch = {
+            "files": [{"path": "src/lib/utils.py", "action": "create", "content": "ok"}],
+        }
+        _validate_patch_result(patch, tmp_path)
+
+
+class TestPausedNowReportConsistency:
+    """[P2] paused_now 発動時の state/report 整合性テスト。"""
+
+    def test_record_failure_paused_state_status(self):
+        """MAX_TASK_FAILURES到達時、stateがPAUSEDになり戻り値がTrue。"""
+        state = {"failure_log": [], "paused_tasks": []}
+        for _ in range(MAX_TASK_FAILURES - 1):
+            result = record_failure(state, "task_x", "deterministic", "err")
+            assert result is False
+        # MAX回目
+        result = record_failure(state, "task_x", "deterministic", "err")
+        assert result is True
+        assert "task_x" in state["paused_tasks"]
+
+    def test_paused_task_excluded_and_none_returned(self):
+        """PAUSED入りしたタスクは次回select_taskで除外される。"""
+        cands = [
+            {"task_id": "task_x", "priority": 1, "auto_fixable": True, "blocked_reason": ""},
+        ]
+        selected = select_task(cands, ["task_x"])
+        assert selected is None
+
+    def test_multiple_failures_same_task_pauses_once(self):
+        """同じタスクの追加失敗はpaused_nowを再度Trueにしない。"""
+        state = {"failure_log": [], "paused_tasks": []}
+        # MAX回でpause
+        for _ in range(MAX_TASK_FAILURES):
+            record_failure(state, "t1", "deterministic", "e")
+        assert "t1" in state["paused_tasks"]
+        # 追加失敗: paused_nowはFalse（既にpaused済み）
+        result = record_failure(state, "t1", "deterministic", "e")
+        assert result is False
+        # paused_tasksに重複追加されていないこと
+        assert state["paused_tasks"].count("t1") == 1
