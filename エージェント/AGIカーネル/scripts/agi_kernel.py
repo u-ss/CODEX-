@@ -13,8 +13,10 @@ AGI Kernel — 自己改善ループ MVP
 
 from __future__ import annotations
 import re
+from abc import ABC, abstractmethod
+import textwrap
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 import argparse
 import json
@@ -65,6 +67,15 @@ FAILURE_CATEGORIES = frozenset({
     "TRANSIENT", "DETERMINISTIC", "ENVIRONMENT", "FLAKY", "POLICY"
 })
 MAX_TASK_FAILURES = 3
+
+# ── EXECUTE/VERIFY 安全制限 ──
+MAX_PATCH_FILES = 5          # 1回のパッチで変更可能な最大ファイル数
+MAX_DIFF_LINES = 200         # 1回のパッチの最大diff行数
+MAX_LLM_RETRIES = 3          # LLM出力バリデーション失敗時の最大リトライ
+COMMAND_ALLOWLIST = [         # VERIFY で実行を許可するコマンド
+    [sys.executable, "-m", "pytest", "-q", "--tb=short", "--color=no"],
+    [sys.executable, "tools/workflow_lint.py"],
+]
 
 
 def classify_failure(error_msg: str) -> str:
@@ -175,6 +186,7 @@ class StateManager:
             "version": __version__,
             "cycle_id": now.strftime("%Y%m%d_%H%M%S"),
             "phase": "BOOT",
+            "last_completed_phase": None,
             "status": "RUNNING",
             "started_at": now.isoformat(),
             "completed_at": None,
@@ -236,22 +248,42 @@ class StateManager:
         # 3. atomic replace
         os.replace(str(self._tmp_path), str(self.state_path))
 
-    def save_candidates(self, candidates: list[dict], date_str: str) -> Path:
-        """日付フォルダにcandidates.jsonを保存する。"""
-        day_dir = self.output_dir / date_str
-        day_dir.mkdir(parents=True, exist_ok=True)
-        path = day_dir / "candidates.json"
+    def save_candidates(self, candidates: list[dict], date_str: str, cycle_id: str) -> Path:
+        """cycle_idフォルダにcandidates.jsonを保存し、latestにもコピーする。
+
+        保存先: {output_dir}/{date_str}/{cycle_id}/candidates.json
+        latest: {output_dir}/{date_str}/latest_candidates.json
+        """
+        cycle_dir = self.output_dir / date_str / cycle_id
+        cycle_dir.mkdir(parents=True, exist_ok=True)
+        path = cycle_dir / "candidates.json"
         with open(path, "w", encoding="utf-8") as f:
             json.dump(candidates, f, ensure_ascii=False, indent=2)
+        # latest コピー
+        latest = self.output_dir / date_str / "latest_candidates.json"
+        try:
+            shutil.copy2(str(path), str(latest))
+        except OSError:
+            pass  # latest コピー失敗は致命的でない
         return path
 
-    def save_report(self, report: dict, date_str: str) -> Path:
-        """日付フォルダにreport.jsonを保存する。"""
-        day_dir = self.output_dir / date_str
-        day_dir.mkdir(parents=True, exist_ok=True)
-        path = day_dir / "report.json"
+    def save_report(self, report: dict, date_str: str, cycle_id: str) -> Path:
+        """cycle_idフォルダにreport.jsonを保存し、latestにもコピーする。
+
+        保存先: {output_dir}/{date_str}/{cycle_id}/report.json
+        latest: {output_dir}/{date_str}/latest_report.json
+        """
+        cycle_dir = self.output_dir / date_str / cycle_id
+        cycle_dir.mkdir(parents=True, exist_ok=True)
+        path = cycle_dir / "report.json"
         with open(path, "w", encoding="utf-8") as f:
             json.dump(report, f, ensure_ascii=False, indent=2)
+        # latest コピー
+        latest = self.output_dir / date_str / "latest_report.json"
+        try:
+            shutil.copy2(str(path), str(latest))
+        except OSError:
+            pass  # latest コピー失敗は致命的でない
         return path
 
 
@@ -259,9 +291,21 @@ class StateManager:
 # pytest出力パーサー（pure function — テスト可能）
 # ============================================================
 
+# ANSIエスケープシーケンス除去（--color=no の保険）
+_RE_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def strip_ansi(text: str) -> str:
+    """ANSIカラーコードを除去する。"""
+    return _RE_ANSI.sub("", text)
+
+
 # errors_count 抽出用パターン
 _RE_ERRORS_IN = re.compile(r"(?:^|\s)(\d+)\s+errors?\s+in\s", re.MULTILINE)
 _RE_INTERRUPTED = re.compile(r"Interrupted:\s+(\d+)\s+errors?\s+during\s+collection")
+
+# summary行（結果行）判定用キーワード
+_SUMMARY_KEYWORDS = ("passed", "failed", "error", "no tests ran")
 
 # headline 候補抽出用キーワード
 _EXCEPTION_NAMES = (
@@ -311,6 +355,25 @@ def _extract_error_lines(lines: list[str], max_lines: int = 10) -> list[str]:
     return result
 
 
+def _find_summary_line(lines: list[str]) -> str:
+    """末尾から逆走査して結果行を探す。warningsではなくpassed/failed/error行を優先。"""
+    # 末尾から逆走査し、結果キーワードを含む行を探す
+    for line in reversed(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # warnings summary ヘッダやwarning個別行はスキップ
+        if "warnings summary" in stripped.lower() or "Warning:" in stripped:
+            continue
+        # 結果行キーワードを含むか
+        lower = stripped.lower()
+        for kw in _SUMMARY_KEYWORDS:
+            if kw in lower:
+                return stripped
+    # フォールバック: 末尾行
+    return lines[-1].strip() if lines else ""
+
+
 def parse_pytest_result(output: str, exit_code: int) -> dict[str, Any]:
     """pytest出力とexit_codeからスキャン結果dictを生成する。
 
@@ -325,9 +388,13 @@ def parse_pytest_result(output: str, exit_code: int) -> dict[str, Any]:
             available, failures, exit_code, summary, tail（後方互換）
             headline, errors_count, error_lines（v0.2.1追加）
     """
-    lines = output.strip().splitlines() if output.strip() else []
-    summary = lines[-1] if lines else ""
+    # ANSI除去（--color=no の保険）
+    clean_output = strip_ansi(output) if output else ""
+    lines = clean_output.strip().splitlines() if clean_output.strip() else []
     tail = lines[-20:] if lines else []  # デバッグ用に末尾20行
+
+    # summary: 末尾から結果行を探索（warningsを飛ばす）
+    summary = _find_summary_line(lines) if lines else ""
 
     # "N failed" パターンをパース
     failures = 0
@@ -346,12 +413,11 @@ def parse_pytest_result(output: str, exit_code: int) -> dict[str, Any]:
 
     # errors_count: "N errors in ..." または "Interrupted: N errors"
     errors_count = 0
-    full_text = output if output else ""
-    m = _RE_ERRORS_IN.search(full_text)
+    m = _RE_ERRORS_IN.search(clean_output)
     if m:
         errors_count = int(m.group(1))
     else:
-        m = _RE_INTERRUPTED.search(full_text)
+        m = _RE_INTERRUPTED.search(clean_output)
         if m:
             errors_count = int(m.group(1))
 
@@ -418,7 +484,7 @@ class Scanner:
         """pytestを実行し結果を返す。"""
         try:
             result = subprocess.run(
-                [sys.executable, "-m", "pytest", "-q", "--tb=no"],
+                [sys.executable, "-m", "pytest", "-q", "--tb=no", "--color=no"],
                 capture_output=True, text=True, timeout=120,
                 cwd=str(self.workspace),
             )
@@ -550,23 +616,319 @@ def _record_ki(outcome: str, **kwargs) -> None:
 
 
 # ============================================================
+# Gemini SDK 遅延インポート
+# ============================================================
+
+def _get_genai():
+    """google.generativeai を遅延importする（未インストールでも起動可能）。"""
+    try:
+        import google.generativeai as genai
+        import warnings
+        warnings.filterwarnings("ignore", category=FutureWarning)
+        api_key = os.environ.get("GOOGLE_API_KEY", "")
+        if not api_key:
+            raise RuntimeError("環境変数 GOOGLE_API_KEY が未設定です")
+        genai.configure(api_key=api_key)
+        return genai
+    except ImportError:
+        raise RuntimeError("google-generativeai がインストールされていません")
+
+
+# ============================================================
+# Executor抽象 + GeminiExecutor
+# ============================================================
+
+class Executor(ABC):
+    """タスク修正パッチを生成する抽象基底クラス。"""
+
+    @abstractmethod
+    def generate_patch(self, task: dict, context: str, workspace: Path) -> dict:
+        """パッチ結果dictを返す。
+
+        Returns:
+            {"files": [{"path": str, "action": str, "content": str}],
+             "explanation": str}
+        """
+        ...
+
+
+_PATCH_PROMPT_TEMPLATE = textwrap.dedent("""\
+    あなたはリポジトリの自動修正エージェントです。
+    以下のタスクを修正するためのパッチをJSON形式で出力してください。
+
+    ## タスク
+    タイトル: {title}
+    説明: {description}
+    ソース: {source}
+
+    ## コンテキスト（スキャン結果の詳細）
+    {context}
+
+    ## 出力形式（厳密に守ること）
+    以下のJSON形式のみ出力してください。説明文やマークダウンは不要です。
+    ```json
+    {{
+      "files": [
+        {{
+          "path": "リポジトリルートからの相対パス",
+          "action": "create または modify",
+          "content": "ファイル全体の内容"
+        }}
+      ],
+      "explanation": "変更の説明（日本語）"
+    }}
+    ```
+
+    ## 制約
+    - 変更ファイル数は最大{max_files}個
+    - リポジトリ外のパスは禁止
+    - 既存コードのスタイルを維持
+    - テストが通ることを最優先
+""")
+
+
+class GeminiExecutor(Executor):
+    """Gemini API でパッチを生成する実装。"""
+
+    def __init__(self, model_name: str = "gemini-2.5-flash"):
+        self.model_name = model_name
+
+    def generate_patch(self, task: dict, context: str, workspace: Path) -> dict:
+        """Gemini API でパッチを生成し、バリデーション済みdictを返す。"""
+        genai = _get_genai()
+        model = genai.GenerativeModel(self.model_name)
+
+        prompt = _PATCH_PROMPT_TEMPLATE.format(
+            title=task.get("title", ""),
+            description=task.get("description", ""),
+            source=task.get("source", ""),
+            context=context[:3000],  # コンテキストは3000文字まで
+            max_files=MAX_PATCH_FILES,
+        )
+
+        last_error = ""
+        for attempt in range(MAX_LLM_RETRIES):
+            try:
+                response = model.generate_content(prompt)
+                raw = response.text
+                patch = _parse_patch_json(raw)
+                _validate_patch_result(patch, workspace)
+                return patch
+            except (json.JSONDecodeError, ValueError, KeyError) as e:
+                last_error = str(e)
+                print(f"[EXECUTE] LLMバリデーション失敗 (attempt {attempt+1}/{MAX_LLM_RETRIES}): {e}")
+                continue
+            except Exception as e:
+                last_error = str(e)
+                print(f"[EXECUTE] LLM呼び出しエラー (attempt {attempt+1}/{MAX_LLM_RETRIES}): {e}")
+                continue
+
+        raise RuntimeError(f"LLMパッチ生成に{MAX_LLM_RETRIES}回失敗: {last_error}")
+
+
+def _parse_patch_json(raw: str) -> dict:
+    """LLM出力からJSON部分を抽出してパースする。"""
+    # ```json ... ``` ブロックを探す
+    m = re.search(r'```(?:json)?\s*\n(.*?)\n```', raw, re.DOTALL)
+    if m:
+        return json.loads(m.group(1))
+    # ブロックなしの場合、全体をJSONとしてパース
+    # 先頭/末尾の非JSONテキストを除去
+    stripped = raw.strip()
+    start = stripped.find('{')
+    end = stripped.rfind('}') + 1
+    if start >= 0 and end > start:
+        return json.loads(stripped[start:end])
+    raise json.JSONDecodeError("JSON not found in LLM output", raw, 0)
+
+
+def _validate_patch_result(patch: dict, workspace: Path) -> None:
+    """パッチ結果をバリデーションする。失敗時はValueError。"""
+    if not isinstance(patch, dict):
+        raise ValueError("パッチ結果がdictではありません")
+    files = patch.get("files")
+    if not isinstance(files, list) or len(files) == 0:
+        raise ValueError("files が空またはリストではありません")
+    if len(files) > MAX_PATCH_FILES:
+        raise ValueError(f"変更ファイル数 {len(files)} > 上限 {MAX_PATCH_FILES}")
+
+    ws_resolved = workspace.resolve()
+    for f in files:
+        if not isinstance(f, dict):
+            raise ValueError("files の各要素はdictである必要があります")
+        path_str = f.get("path", "")
+        if not path_str:
+            raise ValueError("path が空です")
+        # パス安全検証: .. 禁止、workspace 配下であること
+        if ".." in path_str:
+            raise ValueError(f"path に '..' が含まれています: {path_str}")
+        resolved = (workspace / path_str).resolve()
+        if not str(resolved).startswith(str(ws_resolved)):
+            raise ValueError(f"path がワークスペース外です: {path_str}")
+        action = f.get("action", "")
+        if action not in ("create", "modify"):
+            raise ValueError(f"action が不正です: {action}")
+        if "content" not in f:
+            raise ValueError(f"content がありません: {path_str}")
+
+
+def _apply_patch(patch: dict, workspace: Path) -> list[Path]:
+    """パッチをファイルシステムに適用する。変更したパスのリストを返す。"""
+    modified_paths: list[Path] = []
+    for f in patch["files"]:
+        target = workspace / f["path"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f["content"], encoding="utf-8")
+        modified_paths.append(target)
+    return modified_paths
+
+
+def _rollback(modified_paths: list[Path], workspace: Path) -> None:
+    """変更をgit checkoutで元に戻す。新規ファイルは削除。"""
+    for p in modified_paths:
+        try:
+            # git checkout で復元を試みる
+            result = subprocess.run(
+                ["git", "checkout", "--", str(p.relative_to(workspace))],
+                cwd=str(workspace),
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode != 0:
+                # git管理外（新規作成ファイル）→ 削除
+                if p.exists():
+                    p.unlink()
+        except (subprocess.TimeoutExpired, OSError):
+            if p.exists():
+                p.unlink()
+
+
+def _git_diff_stat(workspace: Path) -> tuple[int, str]:
+    """git diff --stat を実行し、変更行数とdiff出力を返す。"""
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--stat"],
+            cwd=str(workspace),
+            capture_output=True, text=True, timeout=10,
+        )
+        output = result.stdout.strip()
+        # 総変更行数を末尾行から抽出
+        lines = output.splitlines()
+        total_changes = 0
+        if lines:
+            m = re.search(r'(\d+) insertion', lines[-1])
+            if m:
+                total_changes += int(m.group(1))
+            m = re.search(r'(\d+) deletion', lines[-1])
+            if m:
+                total_changes += int(m.group(1))
+        return total_changes, output
+    except (subprocess.TimeoutExpired, OSError):
+        return 0, ""
+
+
+def _build_execute_context(task: dict, scan_results: dict) -> str:
+    """EXECUTEフェーズ用のLLMコンテキストを構築する。"""
+    parts = []
+    source = task.get("source", "")
+    if source == "pytest":
+        pytest_data = scan_results.get("pytest", {})
+        parts.append(f"pytest exit_code: {pytest_data.get('exit_code', '?')}")
+        parts.append(f"pytest summary: {pytest_data.get('summary', '')}")
+        headline = pytest_data.get("headline", "")
+        if headline:
+            parts.append(f"headline: {headline}")
+        error_lines = pytest_data.get("error_lines", [])
+        if error_lines:
+            parts.append("error_lines:")
+            parts.extend(f"  {line}" for line in error_lines[:10])
+        tail = pytest_data.get("tail", [])
+        if tail:
+            parts.append("tail (last 20 lines):")
+            parts.extend(f"  {line}" for line in tail)
+    elif source == "workflow_lint":
+        lint_data = scan_results.get("workflow_lint", {})
+        parts.append(f"lint findings: {lint_data.get('findings', [])}")
+    parts.append(f"task description: {task.get('description', '')}")
+    return "\n".join(parts)
+
+
+# ============================================================
+# Verifier
+# ============================================================
+
+class Verifier:
+    """タスク種別に応じた検証コマンドを実行する。"""
+
+    def __init__(self, workspace: Path):
+        self.workspace = workspace
+
+    def verify(self, task: dict) -> dict[str, Any]:
+        """検証を実行し結果dictを返す。
+
+        Returns:
+            {"success": bool, "exit_code": int, "output": str, "command": str}
+        """
+        source = task.get("source", "")
+        if source == "pytest":
+            cmd = [sys.executable, "-m", "pytest", "-q", "--tb=short", "--color=no"]
+        elif source == "workflow_lint":
+            lint_script = self.workspace / "tools" / "workflow_lint.py"
+            if lint_script.exists():
+                cmd = [sys.executable, str(lint_script)]
+            else:
+                # lint スクリプトなし → pytest で代替
+                cmd = [sys.executable, "-m", "pytest", "-q", "--tb=short", "--color=no"]
+        else:
+            cmd = [sys.executable, "-m", "pytest", "-q", "--tb=short", "--color=no"]
+
+        cmd_str = " ".join(cmd)
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=120, cwd=str(self.workspace),
+            )
+            output = (result.stdout + result.stderr)[-2000:]  # 末尾2000文字
+            return {
+                "success": result.returncode == 0,
+                "exit_code": result.returncode,
+                "output": output,
+                "command": cmd_str,
+            }
+        except subprocess.TimeoutExpired:
+            return {
+                "success": False,
+                "exit_code": -1,
+                "output": "タイムアウト (120s)",
+                "command": cmd_str,
+            }
+        except OSError as e:
+            return {
+                "success": False,
+                "exit_code": -1,
+                "output": str(e),
+                "command": cmd_str,
+            }
+
+
+# ============================================================
 # フェーズ順序定義（--resume 用）
 # ============================================================
 
 PHASE_ORDER = ["BOOT", "SCAN", "SENSE", "SELECT", "EXECUTE", "VERIFY", "LEARN", "CHECKPOINT"]
 
 
-def _should_skip_phase(current_phase: str, target_phase: str) -> bool:
+def _should_skip_phase(last_completed: str, target_phase: str) -> bool:
     """resume時、target_phaseが既に完了済みかを判定する。
 
-    current_phaseは「最後に完了したphase」ではなく「最後に開始したphase」。
-    よってcurrent_phase自体はやり直す（安全側）。
+    last_completed は「最後に完了したphase」。
+    target_phase が last_completed 以前 → スキップ。
+    target_phase が last_completed の次 → 再開（スキップしない）。
     """
     try:
-        current_idx = PHASE_ORDER.index(current_phase)
+        completed_idx = PHASE_ORDER.index(last_completed)
         target_idx = PHASE_ORDER.index(target_phase)
-        # target が current より前 → スキップ
-        return target_idx < current_idx
+        # target が completed 以下 → スキップ（完了済み）
+        return target_idx <= completed_idx
     except ValueError:
         return False
 
@@ -600,7 +962,7 @@ def _run_cycle_inner(
     sm: StateManager,
 ) -> int:
     """ロック取得後の内部サイクル実行。"""
-    resume_phase: Optional[str] = None
+    resume_phase: Optional[str] = None  # last_completed_phase（resume判定用）
 
     # ── BOOT ──
     if args.resume:
@@ -619,17 +981,31 @@ def _run_cycle_inner(
                 print("[BOOT] 前回サイクルは完了済み。新規サイクルを開始します。")
                 state = sm.new_state()
             else:
-                # RUNNING → phaseを尊重して再開
-                resume_phase = state.get("phase", "BOOT")
-                print(f"[BOOT] phase={resume_phase} からやり直します。")
+                # RUNNING → last_completed_phase の次から再開
+                # 後方互換: last_completed_phase がなければ phase から推定
+                resume_phase = state.get("last_completed_phase")
+                if resume_phase is None:
+                    # 旧形式: phase は「開始済み」なのでその1つ前を completed とみなす
+                    old_phase = state.get("phase", "BOOT")
+                    try:
+                        idx = PHASE_ORDER.index(old_phase)
+                        resume_phase = PHASE_ORDER[idx - 1] if idx > 0 else None
+                    except ValueError:
+                        resume_phase = None
+                if resume_phase:
+                    print(f"[BOOT] last_completed_phase={resume_phase} の次から再開します。")
+                else:
+                    print("[BOOT] 完了済みフェーズなし。最初から実行します。")
     else:
         state = sm.new_state()
 
     state["phase"] = "BOOT"
+    state["last_completed_phase"] = None
     state["status"] = "RUNNING"
     date_str = datetime.now(JST).strftime("%Y%m%d")
 
     print(f"[BOOT] サイクル開始: cycle_id={state['cycle_id']}")
+    state["last_completed_phase"] = "BOOT"
     sm.save(state)  # BOOT checkpoint
 
     # ── SCAN ──
@@ -639,14 +1015,19 @@ def _run_cycle_inner(
         scanner = Scanner(workspace)
         lint_result = scanner.run_workflow_lint()
         pytest_result = scanner.run_pytest()
+        _lint_errors = max(0, lint_result.get("errors", 0))
+        _pytest_errors = max(0, pytest_result.get("errors_count", 0))
+        _pytest_failures = max(0, pytest_result.get("failures", 0))
         state["scan_results"] = {
             "workflow_lint": lint_result,
             "pytest": pytest_result,
-            "workflow_lint_errors": lint_result.get("errors", 0),
-            "pytest_failures": pytest_result.get("failures", 0),
-            "total_issues": max(0, lint_result.get("errors", 0)) + max(0, pytest_result.get("failures", 0)),
+            "workflow_lint_errors": _lint_errors,
+            "pytest_errors": _pytest_errors,
+            "pytest_failures": _pytest_failures,
+            "total_issues": _lint_errors + _pytest_errors + _pytest_failures,
         }
-        print(f"[SCAN] lint_errors={lint_result.get('errors', 0)}, pytest_failures={pytest_result.get('failures', 0)}")
+        print(f"[SCAN] lint_errors={_lint_errors}, pytest_errors={_pytest_errors}, pytest_failures={_pytest_failures}")
+        state["last_completed_phase"] = "SCAN"
         sm.save(state)  # SCAN checkpoint
     else:
         print("[SCAN] resume: スキップ（完了済み）")
@@ -656,8 +1037,9 @@ def _run_cycle_inner(
         state["phase"] = "SENSE"
         candidates = generate_candidates(state["scan_results"])
         state["candidates"] = candidates
-        sm.save_candidates(candidates, date_str)
+        sm.save_candidates(candidates, date_str, state["cycle_id"])
         print(f"[SENSE] タスク候補: {len(candidates)}件")
+        state["last_completed_phase"] = "SENSE"
         sm.save(state)  # SENSE checkpoint
     else:
         print("[SENSE] resume: スキップ（完了済み）")
@@ -673,6 +1055,7 @@ def _run_cycle_inner(
             state["status"] = "COMPLETED"
             state["completed_at"] = datetime.now(JST).isoformat()
             state["phase"] = "CHECKPOINT"
+            state["last_completed_phase"] = "CHECKPOINT"
             sm.save(state)
             # 候補なし早期終了でも report.json を出力
             report = {
@@ -681,6 +1064,7 @@ def _run_cycle_inner(
                 "reason": "no_candidates",
                 "scan_summary": {
                     "lint_errors": state["scan_results"].get("workflow_lint_errors", 0),
+                    "pytest_errors": state["scan_results"].get("pytest_errors", 0),
                     "pytest_failures": state["scan_results"].get("pytest_failures", 0),
                 },
                 "candidates_count": 0,
@@ -688,27 +1072,67 @@ def _run_cycle_inner(
                 "outcome": "SUCCESS",
                 "paused_tasks": state.get("paused_tasks", []),
             }
-            report_path = sm.save_report(report, date_str)
+            report_path = sm.save_report(report, date_str, state["cycle_id"])
             _record_ki("SUCCESS", cycle_id=state["cycle_id"], task_id="none", note="no_candidates")
             print(f"[CHECKPOINT] state保存完了: {sm.state_path}")
             print(f"[CHECKPOINT] レポート出力: {report_path}")
             return 0
         print(f"[SELECT] タスク選択: {selected['task_id']} — {selected['title']}")
+        state["last_completed_phase"] = "SELECT"
         sm.save(state)  # SELECT checkpoint
     else:
         print("[SELECT] resume: スキップ（完了済み）")
         selected = state.get("selected_task")
 
     # ── EXECUTE ──
+    modified_paths: list[Path] = []  # ロールバック用
     if not (resume_phase and _should_skip_phase(resume_phase, "EXECUTE")):
         state["phase"] = "EXECUTE"
         if args.dry_run:
             print("[EXECUTE] dry-runモード: スキップ")
             state["execution_result"] = {"dry_run": True, "skipped": True}
         else:
-            # MVP: 実行はまだ未実装（将来拡張ポイント）
-            print("[EXECUTE] MVP: 自動実行は未実装。タスクレポートのみ出力します。")
-            state["execution_result"] = {"implemented": False, "note": "MVP — 手動対応が必要"}
+            # Gemini API でパッチ生成→適用
+            print("[EXECUTE] LLMパッチ生成を開始...")
+            try:
+                executor = GeminiExecutor(model_name="gemini-2.5-flash")
+                context = _build_execute_context(selected, state["scan_results"])
+                patch = executor.generate_patch(selected, context, workspace)
+                print(f"[EXECUTE] パッチ生成完了: {len(patch['files'])}ファイル")
+                print(f"[EXECUTE] 説明: {patch.get('explanation', '')[:200]}")
+
+                # パッチ適用
+                modified_paths = _apply_patch(patch, workspace)
+                print(f"[EXECUTE] パッチ適用完了: {[str(p.relative_to(workspace)) for p in modified_paths]}")
+
+                # diff行数チェック
+                diff_lines, diff_output = _git_diff_stat(workspace)
+                print(f"[EXECUTE] diff行数: {diff_lines}")
+                if diff_lines > MAX_DIFF_LINES:
+                    print(f"[EXECUTE] diff行数 {diff_lines} > 上限 {MAX_DIFF_LINES}。ロールバックします。")
+                    _rollback(modified_paths, workspace)
+                    modified_paths = []
+                    state["execution_result"] = {
+                        "success": False,
+                        "error": f"diff行数超過: {diff_lines} > {MAX_DIFF_LINES}",
+                        "patch_explanation": patch.get("explanation", ""),
+                    }
+                else:
+                    state["execution_result"] = {
+                        "success": True,
+                        "files_modified": len(modified_paths),
+                        "diff_lines": diff_lines,
+                        "diff_stat": diff_output,
+                        "patch_explanation": patch.get("explanation", ""),
+                    }
+            except RuntimeError as e:
+                print(f"[EXECUTE] エラー: {e}")
+                state["execution_result"] = {"success": False, "error": str(e)}
+            except Exception as e:
+                print(f"[EXECUTE] 予期しないエラー: {e}")
+                state["execution_result"] = {"success": False, "error": str(e)}
+
+        state["last_completed_phase"] = "EXECUTE"
         sm.save(state)  # EXECUTE checkpoint
     else:
         print("[EXECUTE] resume: スキップ（完了済み）")
@@ -716,12 +1140,33 @@ def _run_cycle_inner(
     # ── VERIFY ──
     if not (resume_phase and _should_skip_phase(resume_phase, "VERIFY")):
         state["phase"] = "VERIFY"
+        exec_result = state.get("execution_result", {})
+
         if args.dry_run:
             print("[VERIFY] dry-runモード: スキップ")
             state["verification_result"] = {"dry_run": True, "skipped": True}
+        elif not exec_result.get("success", False):
+            # EXECUTE が失敗 → VERIFY もスキップ
+            print("[VERIFY] EXECUTE失敗のためスキップ")
+            state["verification_result"] = {"skipped": True, "reason": "execute_failed"}
         else:
-            print("[VERIFY] MVP: 自動検証は未実装。")
-            state["verification_result"] = {"implemented": False}
+            # Verifier で再テスト
+            print("[VERIFY] 検証コマンドを実行中...")
+            verifier = Verifier(workspace)
+            verify_result = verifier.verify(selected)
+            state["verification_result"] = verify_result
+            if verify_result["success"]:
+                print(f"[VERIFY] ✅ 検証成功 (exit_code={verify_result['exit_code']})")
+            else:
+                print(f"[VERIFY] ❌ 検証失敗 (exit_code={verify_result['exit_code']})")
+                print(f"[VERIFY] 出力: {verify_result['output'][:500]}")
+                # 検証失敗 → ロールバック
+                if modified_paths:
+                    print("[VERIFY] 変更をロールバックします...")
+                    _rollback(modified_paths, workspace)
+                    state["verification_result"]["rolled_back"] = True
+
+        state["last_completed_phase"] = "VERIFY"
         sm.save(state)  # VERIFY checkpoint
     else:
         print("[VERIFY] resume: スキップ（完了済み）")
@@ -729,21 +1174,48 @@ def _run_cycle_inner(
     # ── LEARN ──
     if not (resume_phase and _should_skip_phase(resume_phase, "LEARN")):
         state["phase"] = "LEARN"
-        outcome = "SUCCESS" if args.dry_run else "PARTIAL"
+
+        # outcome 判定
+        exec_result = state.get("execution_result", {})
+        verify_result = state.get("verification_result", {})
+        if args.dry_run:
+            outcome = "PARTIAL"
+            note = "dry_run"
+        elif verify_result.get("success", False):
+            outcome = "SUCCESS"
+            note = "auto_fix_verified"
+        elif exec_result.get("success", False) and not verify_result.get("success", False):
+            outcome = "FAILURE"
+            note = "verify_failed"
+            # failure_log に記録
+            error_msg = verify_result.get("output", "verification failed")[:500]
+            category = classify_failure(error_msg)
+            record_failure(state, selected["task_id"], category, error_msg)
+        else:
+            outcome = "FAILURE"
+            note = "execute_failed"
+            error_msg = exec_result.get("error", "execute failed")[:500]
+            category = classify_failure(error_msg)
+            record_failure(state, selected["task_id"], category, error_msg)
+
         _record_ki(
             outcome=outcome,
             cycle_id=state["cycle_id"],
             task_id=selected["task_id"] if selected else "none",
-            note="dry_run" if args.dry_run else "mvp_partial",
+            note=note,
         )
-        print(f"[LEARN] KI Learning記録: outcome={outcome}")
+        print(f"[LEARN] KI Learning記録: outcome={outcome}, note={note}")
+        state["last_completed_phase"] = "LEARN"
         sm.save(state)  # LEARN checkpoint
     else:
         print("[LEARN] resume: スキップ（完了済み）")
-        outcome = "SUCCESS" if args.dry_run else "PARTIAL"
+        outcome = state.get("execution_result", {}).get("success", False) and \
+                  state.get("verification_result", {}).get("success", False)
+        outcome = "SUCCESS" if outcome else "PARTIAL"
 
     # ── CHECKPOINT ──
     state["phase"] = "CHECKPOINT"
+    state["last_completed_phase"] = "CHECKPOINT"
     state["status"] = "COMPLETED"
     state["completed_at"] = datetime.now(JST).isoformat()
     sm.save(state)
@@ -753,6 +1225,7 @@ def _run_cycle_inner(
         "status": state["status"],
         "scan_summary": {
             "lint_errors": state["scan_results"].get("workflow_lint_errors", 0),
+            "pytest_errors": state["scan_results"].get("pytest_errors", 0),
             "pytest_failures": state["scan_results"].get("pytest_failures", 0),
         },
         "candidates_count": len(candidates),
@@ -760,7 +1233,7 @@ def _run_cycle_inner(
         "outcome": outcome,
         "paused_tasks": state.get("paused_tasks", []),
     }
-    report_path = sm.save_report(report, date_str)
+    report_path = sm.save_report(report, date_str, state["cycle_id"])
     print(f"[CHECKPOINT] state保存完了: {sm.state_path}")
     print(f"[CHECKPOINT] レポート出力: {report_path}")
     return 0

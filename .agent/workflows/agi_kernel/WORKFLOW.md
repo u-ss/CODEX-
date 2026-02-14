@@ -76,15 +76,17 @@ python "エージェント/AGIカーネル/scripts/agi_kernel.py" --resume --dry
 | `_outputs/agi_kernel/state.json` | 最新状態 |
 | `_outputs/agi_kernel/state.json.bak` | バックアップ |
 | `_outputs/agi_kernel/lock` | 多重起動防止ロック |
-| `_outputs/agi_kernel/{YYYYMMDD}/candidates.json` | タスク候補 |
-| `_outputs/agi_kernel/{YYYYMMDD}/report.json` | サイクルレポート |
+| `_outputs/agi_kernel/{YYYYMMDD}/{cycle_id}/candidates.json` | タスク候補 |
+| `_outputs/agi_kernel/{YYYYMMDD}/{cycle_id}/report.json` | サイクルレポート |
+| `_outputs/agi_kernel/{YYYYMMDD}/latest_candidates.json` | 最新候補（コピー） |
+| `_outputs/agi_kernel/{YYYYMMDD}/latest_report.json` | 最新レポート（コピー） |
 
 ## 🔄 Phase詳細チェックリスト
 
 ### Phase 1: BOOT
 ```
 □ CLI引数をパース
-□ --resume なら state.json を読込
+□ --resume なら state.json を読込（last_completed_phase の次から再開）
 □ cycle_id を生成（YYYYMMDD_HHMMSS）
 □ WorkflowLogger 開始
 ```
@@ -113,15 +115,23 @@ python "エージェント/AGIカーネル/scripts/agi_kernel.py" --resume --dry
 
 ### Phase 5: EXECUTE (dry-run時スキップ)
 ```
-□ selected_task の内容を実行
-□ 実行結果を execution_result に格納
-□ 失敗時: 失敗分類（TRANSIENT/DETERMINISTIC/ENVIRONMENT/FLAKY/POLICY）
+□ GeminiExecutor でパッチ生成（gemini-2.5-flash / gemini-2.5-pro）
+□ _validate_patch_result でパス安全検証・ファイル数制限
+□ _apply_patch でファイル書き込み
+□ git diff --stat で変更行数チェック（200行超過→ロールバック）
+□ LLMバリデーション失敗時は最大3回リトライ
+□ 失敗時: execution_result.success=false
 ```
 
 ### Phase 6: VERIFY (dry-run時スキップ)
 ```
-□ 実行後の状態を検証
-□ verification_result に格納
+□ EXECUTE成功時のみ実行（失敗時はスキップ）
+□ Verifier がタスク種別に応じたコマンドを実行:
+  - pytest系: python -m pytest -q --tb=short --color=no
+  - lint系: python tools/workflow_lint.py
+□ 成功→ verification_result.success=true
+□ 失敗→ _rollback で変更を元に戻す
+□ verification_result に結果を記録
 ```
 
 ### Phase 7: LEARN
@@ -146,6 +156,7 @@ python "エージェント/AGIカーネル/scripts/agi_kernel.py" --resume --dry
 - **3回失敗 → PAUSED**: 無限ループ防止
 - **dry-runデフォルト推奨**: 破壊的操作は実行しない
 - **POLICY失敗 → 即停止**: permission denied 等
+- **resume安全化**: `last_completed_phase` の次から再開（二重適用防止）
 
 ## 💡 Rules
 

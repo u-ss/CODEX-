@@ -49,6 +49,15 @@ from agi_kernel import (
     select_task,
     record_failure,
     parse_pytest_result,
+    strip_ansi,
+    _should_skip_phase,
+    _validate_patch_result,
+    _apply_patch,
+    _parse_patch_json,
+    _rollback,
+    Verifier,
+    PHASE_ORDER,
+    MAX_PATCH_FILES,
     MAX_TASK_FAILURES,
     LOCK_TTL_SECONDS,
 )
@@ -90,22 +99,35 @@ class TestStateManager:
         assert sm.load() is None
 
     def test_save_candidates(self, tmp_path: Path):
-        """candidates.jsonの保存テスト。"""
+        """candidates.jsonのcycle_idフォルダ保存とlatestコピーテスト。"""
         sm = StateManager(tmp_path)
         candidates = [{"task_id": "lint_000", "priority": 1}]
-        path = sm.save_candidates(candidates, "20260214")
+        path = sm.save_candidates(candidates, "20260214", "20260214_113500")
+        # cycle_id サブフォルダに保存される
         assert path.exists()
+        assert "20260214_113500" in str(path)
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         assert len(data) == 1
         assert data[0]["task_id"] == "lint_000"
+        # latest コピーが存在
+        latest = tmp_path / "20260214" / "latest_candidates.json"
+        assert latest.exists()
+        with open(latest, "r", encoding="utf-8") as f:
+            latest_data = json.load(f)
+        assert latest_data == data
 
     def test_save_report(self, tmp_path: Path):
-        """report.jsonの保存テスト。"""
+        """report.jsonのcycle_idフォルダ保存とlatestコピーテスト。"""
         sm = StateManager(tmp_path)
-        report = {"cycle_id": "test", "status": "COMPLETED"}
-        path = sm.save_report(report, "20260214")
+        report = {"cycle_id": "test_cycle", "status": "COMPLETED"}
+        path = sm.save_report(report, "20260214", "test_cycle")
+        # cycle_id サブフォルダに保存
         assert path.exists()
+        assert "test_cycle" in str(path)
+        # latest コピーが存在
+        latest = tmp_path / "20260214" / "latest_report.json"
+        assert latest.exists()
 
     def test_atomic_write_creates_backup(self, tmp_path: Path):
         """save()で既存state.jsonのバックアップ(.bak)が作られる。"""
@@ -639,3 +661,219 @@ class TestCandidateDescription:
         pytest_cand = [c for c in candidates if c["source"] == "pytest"]
         assert "テスト失敗修正" in pytest_cand[0]["title"]
         assert "3件" in pytest_cand[0]["title"]
+
+
+# ────────────────────────────────────────
+# ANSI除去・summary堅牢化テスト
+# ────────────────────────────────────────
+
+class TestStripAnsi:
+    """strip_ansi() のユニットテスト。"""
+
+    def test_removes_color_codes(self):
+        """ANSIカラーコードが除去される。"""
+        colored = "\x1b[31mERROR collecting tests/a.py\x1b[0m"
+        assert strip_ansi(colored) == "ERROR collecting tests/a.py"
+
+    def test_no_change_for_clean_text(self):
+        """ANSIコードなしのテキストはそのまま。"""
+        clean = "20 passed in 0.5s"
+        assert strip_ansi(clean) == clean
+
+
+class TestAnsiAndSummaryRobustness:
+    """ANSI混入・warnings末尾の堅牢化テスト。"""
+
+    def test_ansi_stripped_errors_count(self):
+        """ANSIエスケープ付き出力でも errors_count を正しく抽出。"""
+        output = (
+            "\x1b[31mERROR collecting tests/test_a.py\x1b[0m\n"
+            "\x1b[31mE   ModuleNotFoundError: No module named 'foo'\x1b[0m\n"
+            "\x1b[31m5 errors in 2.5s\x1b[0m"
+        )
+        result = parse_pytest_result(output, exit_code=2)
+        assert result["errors_count"] == 5
+        # error_lines にもANSI除去後の行が入る
+        assert any("ERROR collecting" in line for line in result["error_lines"])
+        # headline もクリーン
+        assert "\x1b[" not in result["headline"]
+
+    def test_summary_not_warnings_when_trailing(self):
+        """末尾がwarning個別行でもsummaryはwarningsにならない。"""
+        output = (
+            "ERROR collecting tests/test_x.py\n"
+            "E   ImportError: cannot import name 'xyz'\n"
+            "1 error in 0.5s\n"
+            "===== warnings summary =====\n"
+            "some/path.py:10: DeprecationWarning: old API"
+        )
+        result = parse_pytest_result(output, exit_code=2)
+        # summary は "1 error in 0.5s" であるべき
+        assert "error" in result["summary"].lower()
+        assert "DeprecationWarning" not in result["summary"]
+        assert "warnings summary" not in result["summary"]
+
+    def test_summary_finds_result_before_warnings(self):
+        """結果行 + warnings + 空行のパターンでも正しい結果行を返す。"""
+        output = (
+            "collecting...\n"
+            "3 failed, 10 passed in 5.5s\n"
+            "\n"
+            "===== warnings summary =====\n"
+            "lib/foo.py:42: FutureWarning: deprecated"
+        )
+        result = parse_pytest_result(output, exit_code=1)
+        assert "3 failed" in result["summary"]
+        assert result["failures"] == 3
+
+
+# ────────────────────────────────────────
+# resume 位相判定テスト
+# ────────────────────────────────────────
+
+class TestShouldSkipPhase:
+    """_should_skip_phase() の last_completed_phase ベーステスト。"""
+
+    def test_skip_completed_phases(self):
+        """完了済みフェーズはスキップされる。"""
+        # SCANが完了 → BOOT, SCAN はスキップ
+        assert _should_skip_phase("SCAN", "BOOT") is True
+        assert _should_skip_phase("SCAN", "SCAN") is True
+
+    def test_resume_next_phase(self):
+        """完了済みの次のフェーズはスキップされない。"""
+        # SCANが完了 → SENSE は再開対象
+        assert _should_skip_phase("SCAN", "SENSE") is False
+
+    def test_skip_all_before_select(self):
+        """SELECTまで完了 → EXECUTEから再開。"""
+        assert _should_skip_phase("SELECT", "BOOT") is True
+        assert _should_skip_phase("SELECT", "SCAN") is True
+        assert _should_skip_phase("SELECT", "SENSE") is True
+        assert _should_skip_phase("SELECT", "SELECT") is True
+        assert _should_skip_phase("SELECT", "EXECUTE") is False
+        assert _should_skip_phase("SELECT", "VERIFY") is False
+
+    def test_unknown_phase_returns_false(self):
+        """未知のフェーズ名はスキップしない。"""
+        assert _should_skip_phase("UNKNOWN", "SCAN") is False
+        assert _should_skip_phase("SCAN", "UNKNOWN") is False
+
+
+class TestNewStateHasLastCompletedPhase:
+    """新規stateにlast_completed_phaseが含まれる。"""
+
+    def test_new_state_contains_field(self, tmp_path: Path):
+        sm = StateManager(tmp_path)
+        state = sm.new_state()
+        assert "last_completed_phase" in state
+        assert state["last_completed_phase"] is None
+
+
+# ────────────────────────────────────────
+# パッチバリデーション テスト
+# ────────────────────────────────────────
+
+class TestValidatePatchResult:
+    """_validate_patch_result のテスト。"""
+
+    def test_valid_patch(self, tmp_path: Path):
+        """正常なパッチは通る。"""
+        patch = {
+            "files": [{"path": "lib/__init__.py", "action": "create", "content": ""}],
+            "explanation": "テスト",
+        }
+        _validate_patch_result(patch, tmp_path)  # 例外なし
+
+    def test_reject_dotdot_path(self, tmp_path: Path):
+        """.. を含むパスは拒否される。"""
+        patch = {
+            "files": [{"path": "../outside.py", "action": "create", "content": ""}],
+        }
+        with pytest.raises(ValueError, match="\.\."):
+            _validate_patch_result(patch, tmp_path)
+
+    def test_reject_too_many_files(self, tmp_path: Path):
+        """ファイル数超過は拒否。"""
+        files = [{"path": f"f{i}.py", "action": "create", "content": ""} for i in range(MAX_PATCH_FILES + 1)]
+        patch = {"files": files}
+        with pytest.raises(ValueError, match="上限"):
+            _validate_patch_result(patch, tmp_path)
+
+    def test_reject_empty_files(self, tmp_path: Path):
+        """空のfilesは拒否。"""
+        patch = {"files": []}
+        with pytest.raises(ValueError, match="空"):
+            _validate_patch_result(patch, tmp_path)
+
+    def test_reject_invalid_action(self, tmp_path: Path):
+        """不正なactionは拒否。"""
+        patch = {
+            "files": [{"path": "a.py", "action": "delete", "content": ""}],
+        }
+        with pytest.raises(ValueError, match="action"):
+            _validate_patch_result(patch, tmp_path)
+
+
+class TestApplyPatch:
+    """_apply_patch のテスト。"""
+
+    def test_create_file(self, tmp_path: Path):
+        """新規ファイルが作成される。"""
+        patch = {
+            "files": [{"path": "sub/new.py", "action": "create", "content": "# 新規"}],
+        }
+        paths = _apply_patch(patch, tmp_path)
+        assert len(paths) == 1
+        assert (tmp_path / "sub" / "new.py").read_text(encoding="utf-8") == "# 新規"
+
+    def test_modify_file(self, tmp_path: Path):
+        """既存ファイルが変更される。"""
+        target = tmp_path / "exist.py"
+        target.write_text("old", encoding="utf-8")
+        patch = {
+            "files": [{"path": "exist.py", "action": "modify", "content": "new"}],
+        }
+        _apply_patch(patch, tmp_path)
+        assert target.read_text(encoding="utf-8") == "new"
+
+
+class TestParsePatchJson:
+    """_parse_patch_json のテスト。"""
+
+    def test_parse_json_block(self):
+        """```json ブロックからJSON抽出。"""
+        raw = 'テキスト\n```json\n{"files": [], "explanation": "ok"}\n```\n後続テキスト'
+        result = _parse_patch_json(raw)
+        assert result["explanation"] == "ok"
+
+    def test_parse_raw_json(self):
+        """ブロックなしの生JSON。"""
+        raw = '{"files": [{"path": "a.py", "action": "create", "content": ""}]}'
+        result = _parse_patch_json(raw)
+        assert len(result["files"]) == 1
+
+    def test_reject_no_json(self):
+        """JSONがない場合はエラー。"""
+        with pytest.raises(json.JSONDecodeError):
+            _parse_patch_json("ただのテキスト")
+
+
+class TestVerifierCommandSelection:
+    """Verifier のコマンド選択テスト。"""
+
+    def test_pytest_source(self, tmp_path: Path):
+        """pytest系タスクではpytestコマンドが使われる。"""
+        v = Verifier(tmp_path)
+        task = {"source": "pytest", "task_id": "t1"}
+        result = v.verify(task)
+        assert "pytest" in result.get("command", "")
+
+    def test_lint_source_fallback(self, tmp_path: Path):
+        """lint系でスクリプトがなければpytestにフォールバック。"""
+        v = Verifier(tmp_path)
+        task = {"source": "workflow_lint", "task_id": "t2"}
+        result = v.verify(task)
+        # lintスクリプトが存在しないのでpytestが実行される
+        assert "pytest" in result.get("command", "")
+

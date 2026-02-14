@@ -59,11 +59,13 @@ BOOT → SCAN → SENSE → SELECT → EXECUTE → VERIFY → LEARN → CHECKPOI
   "version": "0.2.0",
   "cycle_id": "20260214_005300",
   "phase": "CHECKPOINT",
+  "last_completed_phase": "CHECKPOINT",
   "status": "COMPLETED",
   "started_at": "2026-02-14T00:53:00+09:00",
   "completed_at": "2026-02-14T00:55:00+09:00",
   "scan_results": {
     "workflow_lint_errors": 0,
+    "pytest_errors": 0,
     "pytest_failures": 0,
     "total_issues": 0
   },
@@ -71,14 +73,7 @@ BOOT → SCAN → SENSE → SELECT → EXECUTE → VERIFY → LEARN → CHECKPOI
   "selected_task": null,
   "execution_result": null,
   "verification_result": null,
-  "failure_log": [
-    {
-      "task_id": "fix_lint_xxx",
-      "category": "DETERMINISTIC",
-      "count": 1,
-      "last_error": "..."
-    }
-  ],
+  "failure_log": [],
   "paused_tasks": []
 }
 ```
@@ -89,7 +84,8 @@ BOOT → SCAN → SENSE → SELECT → EXECUTE → VERIFY → LEARN → CHECKPOI
 |:-----------|:---|:-----|
 | `version` | string | スキーマバージョン |
 | `cycle_id` | string | サイクル識別子（`YYYYMMDD_HHMMSS`） |
-| `phase` | enum | 最後に完了したPhase |
+| `phase` | enum | 現在実行中のPhase（クラッシュ検出用） |
+| `last_completed_phase` | enum/null | 最後に完了したPhase（resume判定用） |
 | `status` | enum | `RUNNING` / `COMPLETED` / `FAILED` / `PAUSED` |
 | `started_at` | ISO8601 | サイクル開始時刻 |
 | `completed_at` | ISO8601 | サイクル完了時刻（null可） |
@@ -140,7 +136,9 @@ BOOT → SCAN → SENSE → SELECT → EXECUTE → VERIFY → LEARN → CHECKPOI
 
 ### 再開ルール
 
-- `--resume` 指定時、`state.json` を読み込んで最後のPhaseから再開
+- `--resume` 指定時、`state.json` を読み込んで `last_completed_phase` の次から再開
+- `phase` は「開始済み」、`last_completed_phase` は「完了済み」を示す
+- クラッシュ時: `phase ≠ last_completed_phase` → そのフェーズから再実行
 - `paused_tasks` に含まれるタスクは選択しない
 - 同一タスクの `failure_log.count >= 3` → `paused_tasks` に追加して PAUSED
 
@@ -153,8 +151,9 @@ BOOT → SCAN → SENSE → SELECT → EXECUTE → VERIFY → LEARN → CHECKPOI
 | `_outputs/agi_kernel/state.json` | 最新状態 | ✖ |
 | `_outputs/agi_kernel/state.json.bak` | 前回保存のバックアップ | ✖ |
 | `_outputs/agi_kernel/lock` | 多重起動防止ロック | ✖ |
-| `_outputs/agi_kernel/{YYYYMMDD}/candidates.json` | タスク候補 | ✖ |
-| `_outputs/agi_kernel/{YYYYMMDD}/report.json` | サイクルレポート | ✖ |
+| `_outputs/agi_kernel/{YYYYMMDD}/{cycle_id}/candidates.json` | タスク候補 | ✖ |
+| `_outputs/agi_kernel/{YYYYMMDD}/{cycle_id}/report.json` | サイクルレポート | ✖ |
+| `_outputs/agi_kernel/{YYYYMMDD}/latest_*.json` | 最新コピー | ✖ |
 | `_logs/autonomy/agi_kernel/` | WorkflowLoggerログ | ✖ |
 
 ---
@@ -207,5 +206,19 @@ from workflow_logging_hook import run_logged_main
 - **Atomic Write**: state.jsonはtmp+fsync+os.replaceで保存
 - **Backup/復旧**: save前に.bakを作成、load時に.bakフォールバック
 - **Lockfile**: `_outputs/agi_kernel/lock` で多重起動防止（TTL=600sでstale回収）
-- **Phase Checkpoint**: 各Phase完了時にstate保存、--resumeでそのphaseから再開
+- **Phase Checkpoint**: 各Phase完了時に `last_completed_phase` を更新、--resumeでその次から再開
+- **cycle_id分離**: 出力を `{YYYYMMDD}/{cycle_id}/` に保存、latestコピーも作成
 
+### v0.3.0 EXECUTE/VERIFY 追加ルール
+
+- **Executor抽象**: `Executor` ABCで差し替え可能（現在: `GeminiExecutor`）
+- **GeminiExecutor**: `gemini-2.5-flash`（デフォルト）/ `gemini-2.5-pro` 切替可能
+- **環境変数**: `GOOGLE_API_KEY` 必須（未設定時はRuntimeError）
+- **パッチ安全検証**: `_validate_patch_result` — `..`禁止、workspace配下のみ、action限定
+- **安全制限定数**:
+  - `MAX_PATCH_FILES = 5` — 1回のパッチで変更可能な最大ファイル数
+  - `MAX_DIFF_LINES = 200` — 1回のパッチの最大diff行数
+  - `MAX_LLM_RETRIES = 3` — バリデーション失敗時の最大リトライ
+- **ロールバック**: VERIFY失敗時は `git checkout -- <file>` + 新規ファイル削除
+- **Verifier**: タスク種別に応じた最小コマンド実行（pytest / workflow_lint）
+- **outcome判定**: VERIFY結果で `SUCCESS` / `FAILURE` / `PARTIAL` を分岐
