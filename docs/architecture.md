@@ -70,17 +70,29 @@ When adopting external skills:
 3. Add/update `SKILL.md` and `WORKFLOW.md`.
 4. Ensure `tools/workflow_lint.py` passes.
 
-## AGI Kernel (v0.6.0)
+## AGI Kernel (v0.6.1)
 
-`エージェント/AGIカーネル/scripts/agi_kernel.py` は8フェーズの自己改善ループを実行する。
+`エージェント/AGIカーネル/scripts/` は8フェーズの自己改善ループを実行する。
+
+### v0.6.1 モジュール構成
+
+```
+scripts/
+├── agi_kernel.py   ← エントリーポイント + オーケストレータ
+├── state.py        ← StateManager / FileLock / 失敗分類 / KI記録
+├── scanner.py      ← pytest出力パーサー / Scanner / 候補生成・選択
+├── executor.py     ← GeminiClient / パッチ生成・適用・検証・ロールバック
+├── verifier.py     ← 検証コマンド実行
+└── webhook.py      ← Webhook通知（リトライ/backoff/冪等性キー）
+```
+
+### v0.6.1 変更点
+- **P1**: `google-generativeai` (旧SDK) 完全削除 → `google-genai` 一本化
+- **P2-a**: 全 `print()` → 構造化 `logging` 統一
+- **P2-b**: モノリシック分割（state/scanner/executor/verifier/webhook）
+- **P3-a**: `--workspaces` マルチリポジトリ対応
+- **P3-b**: Webhook堅牢化（リトライ/backoff/jitter/冪等性キー）
 
 ### v0.6.0 追加機能
-- **構造化ログ**: `logging` + `_JsonFormatter` — `--log-json` で JSON 出力
-- **常駐モード**: `--loop --interval N` でサイクル自動繰り返し
-- **承認ゲート**: `--approve` でパッチ適用前に人間の確認
-- **Webhook通知**: `--webhook-url` で Discord/Slack 通知
-- **Lint重要度**: `--lint-severity error,caution` で CAUTION 等取込
-- **コスト追跡**: `token_usage` + 推定コスト (USD) を `report.json` に出力
-- **KI構造化**: `_record_ki()` に構造化メタデータ (failure_class, error_summary 等)
-- **SDK警告**: 旧 `google.generativeai` 使用時に移行推奨ログ
-
+- 構造化ログ / 常駐モード / 承認ゲート / Webhook通知
+- Lint重要度フィルタ / コスト追跡 / KI構造化

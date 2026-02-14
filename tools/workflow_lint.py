@@ -36,12 +36,25 @@ ERROR_PREFIX = "[ERROR]"
 CAUTION_PREFIX = "[CAUTION]"
 ADVISORY_PREFIX = "[ADVISORY]"
 WARN_PREFIX = "[WARN]"  # legacy compatibility
+_IGNORED_DIR_NAMES = frozenset({"__pycache__", ".git", ".pytest_cache"})
 SEVERITY_EXPLANATION = """Severity definition:
 - ERROR: Blocking issue. Must be fixed before completion (missing required files, broken references, logging coverage failure, UTF-8 decode failure).
 - CAUTION: Non-blocking, but should be fixed soon (process/compliance caution).
 - ADVISORY: Informational recommendation (quality/maintenance hint).
 - "WARN" is kept as a legacy alias only. New findings should use CAUTION or ADVISORY.
 """
+
+
+def _iter_visible_dirs(root: Path) -> list[Path]:
+    """隠し/キャッシュ系を除いた直下ディレクトリを返す。"""
+    if not root.exists():
+        return []
+    return sorted(
+        p for p in root.iterdir()
+        if p.is_dir()
+        and p.name not in _IGNORED_DIR_NAMES
+        and not p.name.startswith(".")
+    )
 
 
 def read_utf8_checked(path: Path) -> tuple[str, list[str]]:
@@ -127,7 +140,7 @@ def _lint_sub_agents(wf_path: Path) -> list[str]:
     if not sub_agents_dir.exists():
         return findings
 
-    for sub_dir in sorted(p for p in sub_agents_dir.iterdir() if p.is_dir()):
+    for sub_dir in _iter_visible_dirs(sub_agents_dir):
         # WL-SUB-001: sub_agents/にSKILL.md/WORKFLOW.mdがあればERROR
         for forbidden in ("SKILL.md", "WORKFLOW.md"):
             if (sub_dir / forbidden).exists():
@@ -329,7 +342,7 @@ def lint_cross_ref_script_paths() -> list[str]:
     if not WF_ROOT.exists():
         return findings
 
-    for wf_dir in sorted(p for p in WF_ROOT.iterdir() if p.is_dir()):
+    for wf_dir in _iter_visible_dirs(WF_ROOT):
         if wf_dir.name in {"shared", "claude-skills"}:
             continue
         for md_name in ["SKILL.md", "WORKFLOW.md"]:
@@ -369,7 +382,7 @@ def lint_cross_ref_version() -> list[str]:
     if not WF_ROOT.exists():
         return findings
 
-    for wf_dir in sorted(p for p in WF_ROOT.iterdir() if p.is_dir()):
+    for wf_dir in _iter_visible_dirs(WF_ROOT):
         if wf_dir.name in {"shared", "claude-skills"}:
             continue
         skill = wf_dir / "SKILL.md"
@@ -415,7 +428,7 @@ def lint_slash_commands() -> list[str]:
     if not WF_ROOT.exists():
         return findings
 
-    existing_wfs = {p.name for p in WF_ROOT.iterdir() if p.is_dir()}
+    existing_wfs = {p.name for p in _iter_visible_dirs(WF_ROOT)}
     # ハイフン→アンダースコア / アンダースコア→ハイフンも試行
     existing_variants = set()
     for name in existing_wfs:
@@ -423,7 +436,7 @@ def lint_slash_commands() -> list[str]:
         existing_variants.add(name.replace("-", "_"))
         existing_variants.add(name.replace("_", "-"))
 
-    for wf_dir in sorted(p for p in WF_ROOT.iterdir() if p.is_dir()):
+    for wf_dir in _iter_visible_dirs(WF_ROOT):
         if wf_dir.name in {"shared", "claude-skills"}:
             continue
         for md_file in sorted(wf_dir.rglob("*.md")):
@@ -460,8 +473,8 @@ def lint_disc_coverage() -> list[str]:
         return findings
 
     existing_wfs = {
-        p.name for p in WF_ROOT.iterdir()
-        if p.is_dir() and p.name not in {"shared", "claude-skills"}
+        p.name for p in _iter_visible_dirs(WF_ROOT)
+        if p.name not in {"shared", "claude-skills"}
         and p.name not in WIP_IGNORE_WORKFLOWS
     }
 
@@ -541,7 +554,7 @@ def lint_agent_readmes() -> tuple[list[str], set[str]]:
     if not agents_root.exists():
         return findings, referenced_workflows
 
-    for agent_dir in sorted([p for p in agents_root.iterdir() if p.is_dir()]):
+    for agent_dir in _iter_visible_dirs(agents_root):
         if agent_dir.name in WIP_IGNORE_AGENTS:
             continue
         readme = agent_dir / "README.md"
@@ -626,7 +639,7 @@ def lint_agent_readmes() -> tuple[list[str], set[str]]:
 
 def lint_unreferenced_workflows(referenced_workflows: set[str]) -> list[str]:
     findings: list[str] = []
-    for child in sorted(p for p in WF_ROOT.iterdir() if p.is_dir()):
+    for child in _iter_visible_dirs(WF_ROOT):
         if child.name in {"shared", "claude-skills"}:
             continue
         if child.name in WIP_IGNORE_WORKFLOWS:
@@ -747,7 +760,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     findings: list[str] = []
-    for child in sorted(p for p in WF_ROOT.iterdir() if p.is_dir()):
+    for child in _iter_visible_dirs(WF_ROOT):
         findings.extend(lint_workflow_dir(child))
 
     findings.extend(lint_ops_migration_note())

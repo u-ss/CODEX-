@@ -120,6 +120,38 @@ def test_lint_unreferenced_workflows_emits_advisory_for_unlinked_workflow(
     assert "not referenced" in findings[0]
 
 
+def test_main_ignores_pycache_workflow_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """main実行時、WF直下の__pycache__をワークフローとして扱わない。"""
+    wf_root = tmp_path / "workflows"
+    (wf_root / "demo").mkdir(parents=True)
+    (wf_root / "__pycache__").mkdir(parents=True)
+    visited: list[str] = []
+
+    def _lint(path: Path) -> list[str]:
+        visited.append(path.name)
+        return []
+
+    monkeypatch.setattr(workflow_lint, "WF_ROOT", wf_root)
+    monkeypatch.setattr(workflow_lint, "lint_workflow_dir", _lint)
+    monkeypatch.setattr(workflow_lint, "lint_ops_migration_note", lambda: [])
+    monkeypatch.setattr(workflow_lint, "lint_architecture_doc", lambda: [])
+    monkeypatch.setattr(workflow_lint, "lint_agent_readmes", lambda: ([], {"demo"}))
+    monkeypatch.setattr(workflow_lint, "lint_unreferenced_workflows", lambda _: [])
+    monkeypatch.setattr(workflow_lint, "lint_workflow_logging_coverage", lambda: [])
+    monkeypatch.setattr(workflow_lint, "lint_agent_script_logging_coverage", lambda: [])
+    monkeypatch.setattr(workflow_lint, "lint_cross_ref_script_paths", lambda: [])
+    monkeypatch.setattr(workflow_lint, "lint_cross_ref_version", lambda: [])
+    monkeypatch.setattr(workflow_lint, "lint_slash_commands", lambda: [])
+    monkeypatch.setattr(workflow_lint, "lint_disc_coverage", lambda: [])
+
+    assert workflow_lint.main([]) == 0
+    assert "demo" in visited
+    assert "__pycache__" not in visited
+
+
 # === v1.2.0 新ルールテスト ===
 
 
@@ -324,3 +356,48 @@ def test_readme_template_accepts_recommended_sections(
     findings, _ = workflow_lint.lint_agent_readmes()
 
     assert not any("WL-RMD-" in f for f in findings)
+
+
+def test_lint_agent_readmes_ignores_pycache_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """エージェント直下の__pycache__をmissing README対象にしない。"""
+    wf_root = tmp_path / ".agent" / "workflows"
+    (wf_root / "demo").mkdir(parents=True)
+    agents_root = tmp_path / "エージェント"
+    (agents_root / "__pycache__").mkdir(parents=True)
+    agent_dir = agents_root / "デモエージェント"
+    agent_dir.mkdir(parents=True)
+    (agent_dir / "README.md").write_text(
+        "\n".join(
+            [
+                "# デモエージェント",
+                "",
+                "## ワークフロー定義（正）",
+                "- `.agent/workflows/demo/`",
+                "",
+                "## 使い方（最短）",
+                "```powershell",
+                "python .agent/workflows/demo/scripts/demo.py",
+                "```",
+                "",
+                "## 入出力",
+                "- 入力: task",
+                "- 出力: result",
+                "",
+                "## 注意事項",
+                "- 破壊的操作は禁止",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(workflow_lint, "ROOT", tmp_path)
+    monkeypatch.setattr(workflow_lint, "WF_ROOT", wf_root)
+
+    findings, referenced_workflows = workflow_lint.lint_agent_readmes()
+
+    assert "demo" in referenced_workflows
+    assert not any("__pycache__" in f for f in findings)
