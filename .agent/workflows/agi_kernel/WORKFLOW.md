@@ -3,7 +3,7 @@ name: AGI Kernel v0.5.0
 description: 自己改善ループ（AGIカーネル）— リポジトリスキャン・タスク生成・状態管理・学習記録
 ---
 
-# AGI Kernel v0.4.0 (`/agi_kernel`)
+# AGI Kernel v0.5.0 (`/agi_kernel`)
 
 **リポジトリの健全性をスキャンし、改善タスクを1つずつ処理する自己改善ループ。**
 状態を保存し、中断しても再開できる。
