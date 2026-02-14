@@ -736,6 +736,18 @@ def _get_genai():
         raise RuntimeError("google-generativeai がインストールされていません")
 
 
+def _log_token_usage(response, model_name: str) -> None:
+    """トークン消費をログ出力する。"""
+    try:
+        meta = response.usage_metadata
+        prompt_tokens = getattr(meta, "prompt_token_count", 0)
+        output_tokens = getattr(meta, "candidates_token_count", 0)
+        total = getattr(meta, "total_token_count", 0)
+        print(f"[TOKEN] model={model_name} input={prompt_tokens} output={output_tokens} total={total}")
+    except (AttributeError, TypeError):
+        print("[TOKEN] トークン情報取得不可")
+
+
 # ============================================================
 # Executor抽象 + GeminiExecutor
 # ============================================================
@@ -823,6 +835,8 @@ class GeminiExecutor(Executor):
             try:
                 response = model.generate_content(prompt)
                 raw = response.text
+                # トークン消費ログ
+                _log_token_usage(response, self.model_name)
                 patch = _parse_patch_json(raw)
                 _validate_patch_result(patch, workspace)
                 return patch
@@ -843,6 +857,7 @@ class GeminiExecutor(Executor):
                 try:
                     response = strong_model.generate_content(prompt)
                     raw = response.text
+                    _log_token_usage(response, self.strong_model_name)
                     patch = _parse_patch_json(raw)
                     _validate_patch_result(patch, workspace)
                     return patch
@@ -1080,8 +1095,12 @@ def _compute_patch_diff_lines(
     return total
 
 
-def _build_execute_context(task: dict, scan_results: dict) -> str:
-    """EXECUTEフェーズ用のLLMコンテキストを構築する。"""
+def _build_execute_context(task: dict, scan_results: dict,
+                           workspace: Path | None = None) -> str:
+    """EXECUTEフェーズ用のLLMコンテキストを構築する。
+
+    workspaceが指定されている場合、target_pathのファイル内容も含める。
+    """
     parts = []
     source = task.get("source", "")
     if source == "pytest":
@@ -1103,6 +1122,59 @@ def _build_execute_context(task: dict, scan_results: dict) -> str:
         lint_data = scan_results.get("workflow_lint", {})
         parts.append(f"lint findings: {lint_data.get('findings', [])}")
     parts.append(f"task description: {task.get('description', '')}")
+
+    # ターゲットファイルの内容を読み込んでコンテキストに追加
+    target_path = task.get("target_path", "")
+    if target_path and workspace:
+        target_file = workspace / target_path
+        if target_file.exists() and target_file.is_file():
+            try:
+                content = target_file.read_text(encoding="utf-8", errors="replace")
+                # ファイル内容は最大4000文字まで
+                if len(content) > 4000:
+                    content = content[:4000] + "\n... (截端)"
+                parts.append(f"\n--- target_path: {target_path} ---")
+                parts.append(content)
+            except OSError:
+                pass
+
+    # 依存関係情報を追加
+    if workspace:
+        for dep_file in ["requirements.txt", "pyproject.toml"]:
+            dep_path = workspace / dep_file
+            if dep_path.exists() and dep_path.is_file():
+                try:
+                    dep_content = dep_path.read_text(encoding="utf-8", errors="replace")
+                    if len(dep_content) > 2000:
+                        dep_content = dep_content[:2000] + "\n... (截端)"
+                    parts.append(f"\n--- {dep_file} ---")
+                    parts.append(dep_content)
+                except OSError:
+                    pass
+                break  # どちらか1つあればOK
+
+    # ディレクトリ構造を追加（浅い階層のみ）
+    if workspace:
+        try:
+            tree_lines = []
+            for p in sorted(workspace.rglob("*")):
+                rel = p.relative_to(workspace)
+                # 深さ制限 + 除外ディレクトリ
+                parts_list = rel.parts
+                if len(parts_list) > 3:
+                    continue
+                if any(x.startswith(".") or x in ("__pycache__", "node_modules", "_outputs", "_logs", ".venv", "venv")
+                       for x in parts_list):
+                    continue
+                tree_lines.append(str(rel))
+                if len(tree_lines) >= 50:
+                    break
+            if tree_lines:
+                parts.append("\n--- directory structure (depth<=3) ---")
+                parts.extend(tree_lines)
+        except OSError:
+            pass
+
     return "\n".join(parts)
 
 
@@ -1374,7 +1446,7 @@ def _run_cycle_inner(
                         model_name=model_name,
                         strong_model_name=strong_name,
                     )
-                    context = _build_execute_context(selected, state["scan_results"])
+                    context = _build_execute_context(selected, state["scan_results"], workspace)
                     patch = executor.generate_patch(selected, context, workspace)
                     print(f"[EXECUTE] パッチ生成完了: {len(patch['files'])}ファイル")
                     print(f"[EXECUTE] 説明: {patch.get('explanation', '')[:200]}")
