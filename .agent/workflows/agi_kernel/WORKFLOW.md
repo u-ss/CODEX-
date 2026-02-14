@@ -115,12 +115,16 @@ python "エージェント/AGIカーネル/scripts/agi_kernel.py" --resume --dry
 
 ### Phase 5: EXECUTE (dry-run時スキップ)
 ```
+□ _preflight_check: git利用可能性 + 作業ツリークリーン確認
+  - dirty_worktree → EXECUTE中止・FAILURE扱い
+  - git不在 → difflibベースで安全弁適用（続行）
 □ GeminiExecutor でパッチ生成（gemini-2.5-flash / gemini-2.5-pro）
 □ _validate_patch_result でパス安全検証・ファイル数制限
+□ _backup_targets でバックアップ作成（復元用）
 □ _apply_patch でファイル書き込み
-□ git diff --stat で変更行数チェック（200行超過→ロールバック）
+□ _compute_patch_diff_lines で差分行数チェック（difflib/git非依存、200行超過→ロールバック）
 □ LLMバリデーション失敗時は最大3回リトライ
-□ 失敗時: execution_result.success=false
+□ 失敗時: _rollback_with_backup でバックアップから復元
 ```
 
 ### Phase 6: VERIFY (dry-run時スキップ)
@@ -130,7 +134,9 @@ python "エージェント/AGIカーネル/scripts/agi_kernel.py" --resume --dry
   - pytest系: python -m pytest -q --tb=short --color=no
   - lint系: python tools/workflow_lint.py
 □ 成功→ verification_result.success=true
-□ 失敗→ _rollback で変更を元に戻す
+  - --auto-commit: git add + git commit を自動実行
+  - git環境なら「手動commit推奨」警告を表示
+□ 失敗→ _rollback_with_backup でバックアップから復元（ファイル削除事故なし）
 □ verification_result に結果を記録
 ```
 

@@ -12,11 +12,12 @@ AGI Kernel — 自己改善ループ MVP
 """
 
 from __future__ import annotations
+import difflib
 import re
 from abc import ABC, abstractmethod
 import textwrap
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 import argparse
 import json
@@ -421,9 +422,12 @@ def parse_pytest_result(output: str, exit_code: int) -> dict[str, Any]:
         if m:
             errors_count = int(m.group(1))
 
-    # exit_code!=0 なのに failures==0 → 収集エラー等。最低1を保証
-    if exit_code not in (0, None) and exit_code != -1 and failures == 0:
+    # exit_code==1（テスト失敗）で failures==0 のときのみ補正
+    if exit_code == 1 and failures == 0:
         failures = 1
+    # exit_code==2（収集エラー）では failures を補正しない。errors_count を最低1保証
+    if exit_code == 2 and errors_count == 0:
+        errors_count = 1
 
     # headline: エラー原因が分かる1行
     headline = _extract_headline(lines) if lines else ""
@@ -533,12 +537,8 @@ def generate_candidates(scan_results: dict[str, Any]) -> list[dict[str, Any]]:
     errors_count = pytest_data.get("errors_count", 0)
     description = _build_pytest_description(pytest_data)
 
-    if pytest_failures > 0:
-        # タイトル: errors_count があればそちらを優先表示
-        if errors_count > 0:
-            title = f"収集エラー修正 ({errors_count}件)"
-        else:
-            title = f"テスト失敗修正 ({pytest_failures}件)"
+    if errors_count > 0:
+        title = f"収集エラー修正 ({errors_count}件)"
         candidates.append({
             "task_id": f"pytest_exit_{pytest_exit}",
             "source": "pytest",
@@ -547,7 +547,18 @@ def generate_candidates(scan_results: dict[str, Any]) -> list[dict[str, Any]]:
             "description": description,
             "estimated_effort": "medium",
         })
-    elif pytest_exit not in (0, None) and pytest_exit != -1:
+    if pytest_failures > 0:
+        title = f"テスト失敗修正 ({pytest_failures}件)"
+        candidates.append({
+            "task_id": f"pytest_exit_{pytest_exit}",
+            "source": "pytest",
+            "priority": 2,
+            "title": title,
+            "description": description,
+            "estimated_effort": "medium",
+        })
+    elif pytest_exit not in (0, None) and pytest_exit != -1 and errors_count == 0:
+        # errors_countもfailuresも取れない異常終了
         title = f"pytest異常終了 (exit_code={pytest_exit})"
         candidates.append({
             "task_id": f"pytest_exit_{pytest_exit}",
@@ -783,47 +794,142 @@ def _apply_patch(patch: dict, workspace: Path) -> list[Path]:
     return modified_paths
 
 
-def _rollback(modified_paths: list[Path], workspace: Path) -> None:
-    """変更をgit checkoutで元に戻す。新規ファイルは削除。"""
+# ============================================================
+# Preflight / Backup / Rollback / Diff（v0.3.1 安全強化）
+# ============================================================
+
+def _preflight_check(workspace: Path) -> dict:
+    """EXECUTE前の安全チェック。
+
+    Returns:
+        {"ok": bool, "reason": str, "git_available": bool}
+    """
+    # git 利用可能か
+    try:
+        v = subprocess.run(
+            ["git", "--version"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if v.returncode != 0:
+            return {"ok": True, "reason": "", "git_available": False}
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        # git が無い環境 → diff は difflib で担保するため通す
+        return {"ok": True, "reason": "", "git_available": False}
+
+    # git リポジトリ内か
+    try:
+        rp = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=str(workspace),
+            capture_output=True, text=True, timeout=5,
+        )
+        if rp.returncode != 0:
+            return {"ok": True, "reason": "", "git_available": False}
+    except (subprocess.TimeoutExpired, OSError):
+        return {"ok": True, "reason": "", "git_available": False}
+
+    # 作業ツリーがクリーンか
+    try:
+        st = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(workspace),
+            capture_output=True, text=True, timeout=10,
+        )
+        porcelain = st.stdout.strip()
+        if porcelain:
+            return {"ok": False, "reason": "dirty_worktree", "git_available": True}
+    except (subprocess.TimeoutExpired, OSError):
+        return {"ok": False, "reason": "git_status_failed", "git_available": True}
+
+    return {"ok": True, "reason": "", "git_available": True}
+
+
+def _backup_targets(
+    patch: dict, workspace: Path, backup_dir: Path,
+) -> dict[str, Optional[Path]]:
+    """パッチ適用前に変更対象ファイルのバックアップを作成する。
+
+    Returns:
+        {relative_path: backup_path or None (新規ファイル)}
+    """
+    backup_map: dict[str, Optional[Path]] = {}
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    for f in patch["files"]:
+        rel = f["path"]
+        original = workspace / rel
+        if original.exists():
+            # 既存ファイル → バックアップ
+            bak_path = backup_dir / rel
+            bak_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(original), str(bak_path))
+            backup_map[rel] = bak_path
+        else:
+            # 新規ファイル
+            backup_map[rel] = None
+    return backup_map
+
+
+def _rollback_with_backup(
+    modified_paths: list[Path],
+    backup_map: dict[str, Optional[Path]],
+    workspace: Path,
+) -> None:
+    """バックアップから復元する。新規ファイルは削除。
+
+    git checkout は補助的に試行するが、主はバックアップ復元。
+    """
     for p in modified_paths:
         try:
-            # git checkout で復元を試みる
-            result = subprocess.run(
-                ["git", "checkout", "--", str(p.relative_to(workspace))],
-                cwd=str(workspace),
-                capture_output=True, text=True, timeout=10,
-            )
-            if result.returncode != 0:
-                # git管理外（新規作成ファイル）→ 削除
-                if p.exists():
-                    p.unlink()
-        except (subprocess.TimeoutExpired, OSError):
+            rel = str(p.relative_to(workspace)).replace("\\", "/")
+        except ValueError:
+            continue
+
+        bak = backup_map.get(rel)
+        if bak is not None:
+            # 既存ファイル → バックアップから復元
+            try:
+                shutil.copy2(str(bak), str(p))
+            except OSError:
+                # バックアップ復元失敗 → git checkout を試行
+                try:
+                    subprocess.run(
+                        ["git", "checkout", "--", rel],
+                        cwd=str(workspace),
+                        capture_output=True, text=True, timeout=10,
+                    )
+                except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                    pass  # 最終手段なし — ログだけ残す
+        else:
+            # 新規ファイル → 削除
             if p.exists():
                 p.unlink()
 
 
-def _git_diff_stat(workspace: Path) -> tuple[int, str]:
-    """git diff --stat を実行し、変更行数とdiff出力を返す。"""
-    try:
-        result = subprocess.run(
-            ["git", "diff", "--stat"],
-            cwd=str(workspace),
-            capture_output=True, text=True, timeout=10,
-        )
-        output = result.stdout.strip()
-        # 総変更行数を末尾行から抽出
-        lines = output.splitlines()
-        total_changes = 0
-        if lines:
-            m = re.search(r'(\d+) insertion', lines[-1])
-            if m:
-                total_changes += int(m.group(1))
-            m = re.search(r'(\d+) deletion', lines[-1])
-            if m:
-                total_changes += int(m.group(1))
-        return total_changes, output
-    except (subprocess.TimeoutExpired, OSError):
-        return 0, ""
+def _compute_patch_diff_lines(
+    patch: dict, backup_map: dict[str, Optional[Path]],
+) -> int:
+    """バックアップ vs パッチ内容で純粋な差分行数を算出する（git非依存）。"""
+    total = 0
+    for f in patch["files"]:
+        rel = f["path"]
+        new_content = f.get("content", "")
+        new_lines = new_content.splitlines(keepends=True)
+
+        bak = backup_map.get(rel)
+        if bak is not None and bak.exists():
+            # 既存ファイル → difflib で比較
+            old_lines = bak.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+        else:
+            # 新規ファイル → 全行が追加
+            old_lines = []
+
+        diff = list(difflib.unified_diff(old_lines, new_lines, n=0))
+        for line in diff:
+            if line.startswith("+") and not line.startswith("+++"):
+                total += 1
+            elif line.startswith("-") and not line.startswith("---"):
+                total += 1
+    return total
 
 
 def _build_execute_context(task: dict, scan_results: dict) -> str:
@@ -1086,51 +1192,78 @@ def _run_cycle_inner(
 
     # ── EXECUTE ──
     modified_paths: list[Path] = []  # ロールバック用
+    backup_map: dict[str, Optional[Path]] = {}  # バックアップマップ
     if not (resume_phase and _should_skip_phase(resume_phase, "EXECUTE")):
         state["phase"] = "EXECUTE"
         if args.dry_run:
             print("[EXECUTE] dry-runモード: スキップ")
             state["execution_result"] = {"dry_run": True, "skipped": True}
         else:
-            # Gemini API でパッチ生成→適用
-            print("[EXECUTE] LLMパッチ生成を開始...")
-            try:
-                executor = GeminiExecutor(model_name="gemini-2.5-flash")
-                context = _build_execute_context(selected, state["scan_results"])
-                patch = executor.generate_patch(selected, context, workspace)
-                print(f"[EXECUTE] パッチ生成完了: {len(patch['files'])}ファイル")
-                print(f"[EXECUTE] 説明: {patch.get('explanation', '')[:200]}")
+            # ── Preflight ──
+            preflight = _preflight_check(workspace)
+            if not preflight["ok"]:
+                reason = preflight["reason"]
+                print(f"[EXECUTE] ❌ Preflight失敗: {reason}")
+                state["execution_result"] = {
+                    "success": False,
+                    "error": f"preflight_failed: {reason}",
+                    "reason": reason,
+                }
+            else:
+                if not preflight["git_available"]:
+                    print("[EXECUTE] ⚠️ git不在 — difflibベースで安全弁を適用")
 
-                # パッチ適用
-                modified_paths = _apply_patch(patch, workspace)
-                print(f"[EXECUTE] パッチ適用完了: {[str(p.relative_to(workspace)) for p in modified_paths]}")
+                # ── LLMパッチ生成→バックアップ→適用→diff検証 ──
+                print("[EXECUTE] LLMパッチ生成を開始...")
+                try:
+                    executor = GeminiExecutor(model_name="gemini-2.5-flash")
+                    context = _build_execute_context(selected, state["scan_results"])
+                    patch = executor.generate_patch(selected, context, workspace)
+                    print(f"[EXECUTE] パッチ生成完了: {len(patch['files'])}ファイル")
+                    print(f"[EXECUTE] 説明: {patch.get('explanation', '')[:200]}")
 
-                # diff行数チェック
-                diff_lines, diff_output = _git_diff_stat(workspace)
-                print(f"[EXECUTE] diff行数: {diff_lines}")
-                if diff_lines > MAX_DIFF_LINES:
-                    print(f"[EXECUTE] diff行数 {diff_lines} > 上限 {MAX_DIFF_LINES}。ロールバックします。")
-                    _rollback(modified_paths, workspace)
-                    modified_paths = []
-                    state["execution_result"] = {
-                        "success": False,
-                        "error": f"diff行数超過: {diff_lines} > {MAX_DIFF_LINES}",
-                        "patch_explanation": patch.get("explanation", ""),
-                    }
-                else:
-                    state["execution_result"] = {
-                        "success": True,
-                        "files_modified": len(modified_paths),
-                        "diff_lines": diff_lines,
-                        "diff_stat": diff_output,
-                        "patch_explanation": patch.get("explanation", ""),
-                    }
-            except RuntimeError as e:
-                print(f"[EXECUTE] エラー: {e}")
-                state["execution_result"] = {"success": False, "error": str(e)}
-            except Exception as e:
-                print(f"[EXECUTE] 予期しないエラー: {e}")
-                state["execution_result"] = {"success": False, "error": str(e)}
+                    # バックアップ作成
+                    date_str = datetime.now(JST).strftime("%Y%m%d")
+                    backup_dir = output_dir / date_str / state["cycle_id"] / "backup"
+                    backup_map = _backup_targets(patch, workspace, backup_dir)
+                    print(f"[EXECUTE] バックアップ完了: {backup_dir}")
+
+                    # パッチ適用
+                    modified_paths = _apply_patch(patch, workspace)
+                    print(f"[EXECUTE] パッチ適用完了: {[str(p.relative_to(workspace)) for p in modified_paths]}")
+
+                    # diff行数チェック（difflibベース — git非依存）
+                    diff_lines = _compute_patch_diff_lines(patch, backup_map)
+                    print(f"[EXECUTE] diff行数: {diff_lines}")
+                    if diff_lines > MAX_DIFF_LINES:
+                        print(f"[EXECUTE] diff行数 {diff_lines} > 上限 {MAX_DIFF_LINES}。ロールバックします。")
+                        _rollback_with_backup(modified_paths, backup_map, workspace)
+                        modified_paths = []
+                        state["execution_result"] = {
+                            "success": False,
+                            "error": f"diff行数超過: {diff_lines} > {MAX_DIFF_LINES}",
+                            "patch_explanation": patch.get("explanation", ""),
+                        }
+                    else:
+                        state["execution_result"] = {
+                            "success": True,
+                            "files_modified": len(modified_paths),
+                            "diff_lines": diff_lines,
+                            "patch_explanation": patch.get("explanation", ""),
+                            "git_available": preflight["git_available"],
+                        }
+                except RuntimeError as e:
+                    print(f"[EXECUTE] エラー: {e}")
+                    if modified_paths:
+                        _rollback_with_backup(modified_paths, backup_map, workspace)
+                        modified_paths = []
+                    state["execution_result"] = {"success": False, "error": str(e)}
+                except Exception as e:
+                    print(f"[EXECUTE] 予期しないエラー: {e}")
+                    if modified_paths:
+                        _rollback_with_backup(modified_paths, backup_map, workspace)
+                        modified_paths = []
+                    state["execution_result"] = {"success": False, "error": str(e)}
 
         state["last_completed_phase"] = "EXECUTE"
         sm.save(state)  # EXECUTE checkpoint
@@ -1157,13 +1290,34 @@ def _run_cycle_inner(
             state["verification_result"] = verify_result
             if verify_result["success"]:
                 print(f"[VERIFY] ✅ 検証成功 (exit_code={verify_result['exit_code']})")
+                # auto-commit / 警告
+                exec_git = state.get("execution_result", {}).get("git_available", False)
+                if getattr(args, "auto_commit", False) and exec_git:
+                    try:
+                        subprocess.run(
+                            ["git", "add", "-A"],
+                            cwd=str(workspace),
+                            capture_output=True, text=True, timeout=10,
+                        )
+                        task_id = selected.get("id", "unknown") if selected else "unknown"
+                        subprocess.run(
+                            ["git", "commit", "-m", f"[AGI-Kernel] auto-fix: {task_id}"],
+                            cwd=str(workspace),
+                            capture_output=True, text=True, timeout=10,
+                        )
+                        print("[VERIFY] 🔒 auto-commit 完了")
+                        state["verification_result"]["auto_committed"] = True
+                    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as ce:
+                        print(f"[VERIFY] ⚠️ auto-commit 失敗: {ce}")
+                elif exec_git:
+                    print("[VERIFY] ⚠️ VERIFY成功。次サイクル安定化のため手動commitを推奨します。")
             else:
                 print(f"[VERIFY] ❌ 検証失敗 (exit_code={verify_result['exit_code']})")
                 print(f"[VERIFY] 出力: {verify_result['output'][:500]}")
-                # 検証失敗 → ロールバック
+                # 検証失敗 → ロールバック（バックアップ復元）
                 if modified_paths:
                     print("[VERIFY] 変更をロールバックします...")
-                    _rollback(modified_paths, workspace)
+                    _rollback_with_backup(modified_paths, backup_map, workspace)
                     state["verification_result"]["rolled_back"] = True
 
         state["last_completed_phase"] = "VERIFY"
@@ -1259,6 +1413,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run", action="store_true", dest="dry_run",
         help="EXECUTE/VERIFYフェーズをスキップ",
+    )
+    parser.add_argument(
+        "--auto-commit", action="store_true", dest="auto_commit",
+        help="VERIFY成功時に自動commitする（デフォルトOFF）",
     )
     parser.add_argument(
         "--workspace", type=str, default=str(_DEFAULT_WORKSPACE),

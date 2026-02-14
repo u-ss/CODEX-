@@ -54,7 +54,10 @@ from agi_kernel import (
     _validate_patch_result,
     _apply_patch,
     _parse_patch_json,
-    _rollback,
+    _preflight_check,
+    _backup_targets,
+    _rollback_with_backup,
+    _compute_patch_diff_lines,
     Verifier,
     PHASE_ORDER,
     MAX_PATCH_FILES,
@@ -464,10 +467,11 @@ class TestParsePytestResult:
         assert result["available"] is True
 
     def test_exit2_no_failed_line(self):
-        """exit_code=2 で 'failed' 行なし → failures>=1（収集エラー）。"""
+        """exit_code=2 で 'failed' 行なし → failures=0、errors_count>=1（収集エラー）。"""
         output = "ERROR collecting tests/test_broken.py\n1 error"
         result = parse_pytest_result(output, exit_code=2)
-        assert result["failures"] >= 1
+        assert result["failures"] == 0           # v0.3.1: 収集エラーではfailures補正しない
+        assert result["errors_count"] >= 1        # errors_countを保証
         assert result["exit_code"] == 2
 
     def test_exit0_all_pass(self):
@@ -604,6 +608,49 @@ class TestParsePytestResult:
         for key in ("headline", "errors_count", "error_lines"):
             assert key in result
 
+    # ── v0.3.1: exit_code別補正ルール分離テスト ──
+
+    def test_exit2_5errors_separates_correctly(self):
+        """exit_code=2 + '5 errors during collection' → errors_count=5, failures=0。"""
+        output = (
+            "ERROR collecting tests/test_a.py\n"
+            "ERROR collecting tests/test_b.py\n"
+            "Interrupted: 5 errors during collection"
+        )
+        result = parse_pytest_result(output, exit_code=2)
+        assert result["errors_count"] == 5
+        assert result["failures"] == 0
+
+    def test_exit1_3failed_separates_correctly(self):
+        """exit_code=1 + '3 failed' → failures=3, errors_count=0。"""
+        output = "FAILED tests/test_a.py\n3 failed, 7 passed in 1.0s"
+        result = parse_pytest_result(output, exit_code=1)
+        assert result["failures"] == 3
+        assert result["errors_count"] == 0
+
+    def test_exit2_no_errors_number_guarantees_min1(self):
+        """exit_code=2 でerrors数が取れなくても errors_count>=1、failures==0。"""
+        output = "something went wrong"
+        result = parse_pytest_result(output, exit_code=2)
+        assert result["errors_count"] >= 1
+        assert result["failures"] == 0
+
+    def test_exit2_candidates_generates_collection_error(self):
+        """収集エラー(errors_count>0, failures==0)でも候補が生成される。"""
+        scan = {
+            "workflow_lint": {"errors": 0, "findings": []},
+            "pytest": {
+                "failures": 0, "exit_code": 2,
+                "headline": "ERROR collecting tests/test_x.py",
+                "errors_count": 3,
+                "error_lines": ["ERROR collecting tests/test_x.py"],
+            },
+        }
+        candidates = generate_candidates(scan)
+        pytest_cand = [c for c in candidates if c["source"] == "pytest"]
+        assert len(pytest_cand) >= 1
+        assert "収集エラー修正" in pytest_cand[0]["title"]
+
 
 # ────────────────────────────────────────
 # generate_candidates description品質テスト
@@ -617,7 +664,7 @@ class TestCandidateDescription:
         scan = {
             "workflow_lint": {"errors": 0, "findings": []},
             "pytest": {
-                "failures": 1, "exit_code": 2,
+                "failures": 0, "exit_code": 2,   # v0.3.1: 収集エラーはfailures=0
                 "summary": "some/path.py:10: DeprecationWarning: old",
                 "headline": "ERROR collecting tests/test_x.py",
                 "errors_count": 1,
@@ -635,7 +682,7 @@ class TestCandidateDescription:
         scan = {
             "workflow_lint": {"errors": 0, "findings": []},
             "pytest": {
-                "failures": 1, "exit_code": 2,
+                "failures": 0, "exit_code": 2,   # v0.3.1: 収集エラーはfailures=0
                 "headline": "ERROR collecting",
                 "errors_count": 9,
                 "error_lines": [],
@@ -876,4 +923,115 @@ class TestVerifierCommandSelection:
         result = v.verify(task)
         # lintスクリプトが存在しないのでpytestが実行される
         assert "pytest" in result.get("command", "")
+
+
+# ────────────────────────────────────────
+# Preflight テスト
+# ────────────────────────────────────────
+
+class TestPreflightCheck:
+    """_preflight_check のテスト。"""
+
+    def test_returns_dict_with_required_keys(self, tmp_path: Path):
+        """戻り値に ok, reason, git_available が含まれる。"""
+        result = _preflight_check(tmp_path)
+        assert "ok" in result
+        assert "reason" in result
+        assert "git_available" in result
+
+    def test_non_git_dir_is_ok(self, tmp_path: Path):
+        """gitリポジトリでないディレクトリではgit_available=Falseだがok=True。"""
+        result = _preflight_check(tmp_path)
+        # tmp_pathはgitリポジトリではない
+        # git_available はFalse (not a repo) だが ok=True
+        assert result["ok"] is True
+
+
+# ────────────────────────────────────────
+# Backup & Rollback テスト
+# ────────────────────────────────────────
+
+class TestBackupAndRollback:
+    """_backup_targets / _rollback_with_backup のテスト。"""
+
+    def test_backup_existing_file(self, tmp_path: Path):
+        """既存ファイルのバックアップが作成される。"""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        (workspace / "a.py").write_text("original", encoding="utf-8")
+        backup_dir = tmp_path / "backup"
+        patch = {"files": [{"path": "a.py", "action": "modify", "content": "changed"}]}
+        bmap = _backup_targets(patch, workspace, backup_dir)
+        assert bmap["a.py"] is not None
+        assert bmap["a.py"].read_text(encoding="utf-8") == "original"
+
+    def test_backup_new_file_is_none(self, tmp_path: Path):
+        """新規ファイルはbackup_map値がNone。"""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        backup_dir = tmp_path / "backup"
+        patch = {"files": [{"path": "new.py", "action": "create", "content": "x"}]}
+        bmap = _backup_targets(patch, workspace, backup_dir)
+        assert bmap["new.py"] is None
+
+    def test_rollback_restores_from_backup(self, tmp_path: Path):
+        """ロールバック時にバックアップから復元される。"""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        target = workspace / "a.py"
+        target.write_text("original", encoding="utf-8")
+        backup_dir = tmp_path / "backup"
+        patch = {"files": [{"path": "a.py", "action": "modify", "content": "bad"}]}
+        bmap = _backup_targets(patch, workspace, backup_dir)
+        # パッチ適用
+        _apply_patch(patch, workspace)
+        assert target.read_text(encoding="utf-8") == "bad"
+        # ロールバック
+        _rollback_with_backup([target], bmap, workspace)
+        assert target.read_text(encoding="utf-8") == "original"
+
+    def test_rollback_deletes_new_file(self, tmp_path: Path):
+        """新規ファイルはロールバック時に削除される。"""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        patch = {"files": [{"path": "new.py", "action": "create", "content": "x"}]}
+        bmap = _backup_targets(patch, workspace, tmp_path / "backup")
+        modified = _apply_patch(patch, workspace)
+        assert (workspace / "new.py").exists()
+        _rollback_with_backup(modified, bmap, workspace)
+        assert not (workspace / "new.py").exists()
+
+
+# ────────────────────────────────────────
+# Patch Diff Lines テスト
+# ────────────────────────────────────────
+
+class TestComputePatchDiffLines:
+    """_compute_patch_diff_lines のテスト。"""
+
+    def test_new_file_counts_all_lines(self, tmp_path: Path):
+        """新規ファイルは全行が+カウント。"""
+        patch = {"files": [{"path": "new.py", "action": "create", "content": "a\nb\nc"}]}
+        bmap = {"new.py": None}
+        assert _compute_patch_diff_lines(patch, bmap) == 3
+
+    def test_modified_file_counts_changes(self, tmp_path: Path):
+        """変更ファイルは差分行のみカウント。"""
+        bak = tmp_path / "old.py"
+        bak.write_text("line1\nline2\nline3", encoding="utf-8")
+        patch = {"files": [{
+            "path": "old.py", "action": "modify",
+            "content": "line1\nchanged\nline3",  # line2 → changed
+        }]}
+        bmap = {"old.py": bak}
+        # -line2 +changed = 2行
+        assert _compute_patch_diff_lines(patch, bmap) == 2
+
+    def test_no_change_is_zero(self, tmp_path: Path):
+        """変更なしは0。"""
+        bak = tmp_path / "same.py"
+        bak.write_text("hello\n", encoding="utf-8")
+        patch = {"files": [{"path": "same.py", "action": "modify", "content": "hello\n"}]}
+        bmap = {"same.py": bak}
+        assert _compute_patch_diff_lines(patch, bmap) == 0
 
