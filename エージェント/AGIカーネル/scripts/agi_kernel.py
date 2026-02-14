@@ -23,6 +23,17 @@ __version__ = "0.4.0"
 import argparse
 import json
 import os
+
+# .env 自動読み込み（python-dotenvがあれば）
+try:
+    from dotenv import load_dotenv
+    # スクリプトからワークスペースルートの .env を探す
+    _dotenv_path = os.path.join(os.path.dirname(__file__), "..", "..", "..", ".env")
+    if os.path.isfile(_dotenv_path):
+        load_dotenv(_dotenv_path, override=False)
+except ImportError:
+    pass  # dotenv 未インストールでも動作可能
+
 import shutil
 import subprocess
 import sys
