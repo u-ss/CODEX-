@@ -294,20 +294,44 @@ def _build_pytest_description(pytest_data: dict[str, Any]) -> str:
     return desc[:800]
 
 
+def _extract_lint_target_path(finding: str) -> str:
+    """lint finding文字列からターゲットファイルパスを抽出する。
+
+    形式例: [ERROR] C:/path/to/file: description (WL-XXX-YYY)
+             [ERROR] agent 'name': description (WL-XXX-YYY)
+    パスはドライブレター(X:/) または相対パスで始まる部分を検出。
+    """
+    # [SEVERITY] の後の部分を取得
+    m = re.match(r"\[(?:ERROR|CAUTION|WARNING)\]\s+(.+)", finding)
+    if not m:
+        return ""
+    rest = m.group(1)
+    # ドライブレター付き絶対パス (C:/... : description)
+    m2 = re.match(r"([A-Za-z]:/[^:]+?):\s", rest)
+    if m2:
+        return m2.group(1).strip()
+    # agent 'name': の場合はパス不明
+    return ""
+
+
 def generate_candidates(scan_results: dict[str, Any]) -> list[dict[str, Any]]:
     """スキャン結果からタスク候補を生成する。"""
     candidates = []
     lint_data = scan_results.get("workflow_lint", {})
     for finding in lint_data.get("findings", []):
         task_id = _stable_task_id("lint", finding[:200])
-        candidates.append({
+        target_path = _extract_lint_target_path(finding)
+        candidate: dict[str, Any] = {
             "task_id": task_id,
             "source": "workflow_lint",
             "priority": 1,
             "title": f"Lint修正: {finding[:80]}",
             "description": finding,
             "estimated_effort": "low",
-        })
+        }
+        if target_path:
+            candidate["target_path"] = target_path
+        candidates.append(candidate)
 
     pytest_data = scan_results.get("pytest", {})
     pytest_exit = pytest_data.get("exit_code", 0)

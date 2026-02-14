@@ -180,6 +180,7 @@ _PATCH_PROMPT_TEMPLATE = textwrap.dedent("""\
     タイトル: {title}
     説明: {description}
     ソース: {source}
+    {target_path_section}
 
     ## コンテキスト（スキャン結果の詳細）
     {context}
@@ -204,6 +205,7 @@ _PATCH_PROMPT_TEMPLATE = textwrap.dedent("""\
     - リポジトリ外のパスは禁止
     - 既存コードのスタイルを維持
     - テストが通ることを最優先
+    {target_path_constraint}
 """)
 
 
@@ -214,6 +216,7 @@ class GeminiExecutor(Executor):
         self,
         model_name: str = "gemini-2.5-flash",
         strong_model_name: str = "gemini-2.5-pro",
+        state: Optional[dict] = None,
     ):
         self.model_name = (
             os.environ.get("AGI_KERNEL_LLM_MODEL") or model_name
@@ -221,11 +224,21 @@ class GeminiExecutor(Executor):
         self.strong_model_name = (
             os.environ.get("AGI_KERNEL_LLM_STRONG_MODEL") or strong_model_name
         )
+        self._state = state  # token_usage累積用
 
     def generate_patch(self, task: dict, context: str, workspace: Path) -> dict:
         """Gemini API でパッチを生成し、バリデーション済dictを返す。"""
         client = get_genai_client()
         logger.info(f"[EXECUTE] Gemini SDK backend={client.backend}")
+
+        # target_path制約をプロンプトに注入
+        target_path = task.get("target_path", "")
+        if target_path:
+            target_path_section = f"対象ファイル: {target_path}"
+            target_path_constraint = f"- ⚠️ 変更対象は {target_path} のみ。他のファイルの変更は禁止。"
+        else:
+            target_path_section = ""
+            target_path_constraint = ""
 
         prompt = _PATCH_PROMPT_TEMPLATE.format(
             title=task.get("title", ""),
@@ -233,6 +246,8 @@ class GeminiExecutor(Executor):
             source=task.get("source", ""),
             context=context[:3000],
             max_files=MAX_PATCH_FILES,
+            target_path_section=target_path_section,
+            target_path_constraint=target_path_constraint,
         )
 
         # フェーズ1: 通常モデルで試行
@@ -241,7 +256,7 @@ class GeminiExecutor(Executor):
             try:
                 response = client.generate_content(self.model_name, prompt)
                 raw = _extract_response_text(response)
-                log_token_usage(response, self.model_name)
+                log_token_usage(response, self.model_name, self._state)
                 patch = parse_patch_json(raw)
                 validate_patch_result(patch, workspace)
                 return patch
@@ -263,7 +278,7 @@ class GeminiExecutor(Executor):
                 try:
                     response = client.generate_content(self.strong_model_name, prompt)
                     raw = _extract_response_text(response)
-                    log_token_usage(response, self.strong_model_name)
+                    log_token_usage(response, self.strong_model_name, self._state)
                     patch = parse_patch_json(raw)
                     validate_patch_result(patch, workspace)
                     return patch
@@ -355,8 +370,12 @@ def parse_patch_json(raw: str) -> dict:
     raise json.JSONDecodeError("JSON not found in LLM output", raw, 0)
 
 
-def validate_patch_result(patch: dict, workspace: Path) -> None:
-    """パッチ結果をバリデーションする。失敗時はValueError。"""
+def validate_patch_result(patch: dict, workspace: Path, *, target_path: str = "") -> None:
+    """パッチ結果をバリデーションする。失敗時はValueError。
+
+    target_path が指定された場合、パッチの全ファイルがそのパスに
+    限定されているかも検証する。
+    """
     if not isinstance(patch, dict):
         raise ValueError("パッチ結果がdictではありません")
     files = patch.get("files")
@@ -364,6 +383,16 @@ def validate_patch_result(patch: dict, workspace: Path) -> None:
         raise ValueError("files が空またはリストではありません")
     if len(files) > MAX_PATCH_FILES:
         raise ValueError(f"変更ファイル数 {len(files)} > 上限 {MAX_PATCH_FILES}")
+
+    # target_path正規化（絶対パス→相対パス変換を試みる）
+    normalized_target = ""
+    if target_path:
+        tp = Path(target_path)
+        try:
+            normalized_target = str(tp.resolve().relative_to(workspace.resolve())).replace("\\", "/")
+        except ValueError:
+            # 既に相対パスの場合はそのまま使用
+            normalized_target = target_path.replace("\\", "/")
 
     ws_resolved = workspace.resolve()
     for f in files:
@@ -385,6 +414,14 @@ def validate_patch_result(patch: dict, workspace: Path) -> None:
             raise ValueError(f"action が不正です: {action}")
         if "content" not in f:
             raise ValueError(f"content がありません: {path_str}")
+
+        # target_path制約: 指定されたファイルのみ変更可能
+        if normalized_target:
+            patch_path_normalized = path_str.replace("\\", "/")
+            if patch_path_normalized != normalized_target:
+                raise ValueError(
+                    f"target_path制約違反: {path_str} は対象外 (許可: {normalized_target})"
+                )
 
 
 # ============================================================

@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AGI Kernel — 自己改善ループ (v0.6.1)
+AGI Kernel — 自己改善ループ (v0.6.3)
 
 リポジトリの健全性をスキャン→タスク候補生成→1つ選択→(実行/検証)→学習記録→状態保存
 を1サイクルとして実行する。
 
-v0.6.1 変更点:
-  - P1: google.generativeai (旧SDK) フォールバック完全削除 → google-genai 一本化
-  - P2-a: 全 print() → 構造化 logger 統一
-  - P2-b: ファイル分割 (state/scanner/executor/verifier/webhook)
-  - P3-a: --workspaces マルチリポ対応
-  - P3-b: Webhook堅牢化 (retry/backoff/jitter/idempotency)
+終了コード:
+  EXIT_SUCCESS  (0) — 正常完了 / FAILURE後のロールバック完了
+  EXIT_PAUSED   (1) — タスクが3回失敗しPAUSED / env blocker / resume PAUSED
+  EXIT_LOCK     (2) — 別プロセスがロック保持中
 
 使用例:
     python agi_kernel.py --once --dry-run
@@ -21,7 +19,12 @@ v0.6.1 変更点:
 
 from __future__ import annotations
 
-__version__ = "0.6.1"
+__version__ = "0.6.3"
+
+# ── 終了コード定数 ──
+EXIT_SUCCESS = 0   # 正常完了 / FAILURE後のロールバック完了
+EXIT_PAUSED = 1    # PAUSED（3回失敗）/ BLOCKED / resume PAUSED
+EXIT_LOCK = 2      # 別プロセスがロック保持中
 
 import argparse
 import json
@@ -196,7 +199,7 @@ def run_cycle(args: argparse.Namespace, workspace: Path | None = None) -> int:
     lock = FileLock(output_dir / "lock")
     if not lock.acquire():
         logger.warning("[LOCK] 別のAGI Kernelプロセスが実行中です。終了します。")
-        return 2
+        return EXIT_LOCK
 
     try:
         return _run_cycle_inner(args, ws, output_dir, sm)
@@ -223,7 +226,7 @@ def _run_cycle_inner(
             logger.info(f"[BOOT] state.jsonから再開: cycle_id={state['cycle_id']}, phase={state['phase']}")
             if state.get("status") == "PAUSED":
                 logger.warning("[BOOT] ステータスがPAUSEDです。手動でリセットしてください。")
-                return 1
+                return EXIT_PAUSED
             if state.get("status") == "COMPLETED":
                 logger.info("[BOOT] 前回サイクルは完了済み。新規サイクルを開始します。")
                 state = sm.new_state()
@@ -377,7 +380,7 @@ def _run_cycle_inner(
                 record_ki("FAILURE", cycle_id=state["cycle_id"],
                           task_id=selected["task_id"] if selected else "none",
                           note=f"env_blocker:{reason}")
-                return 1
+                return EXIT_PAUSED
             else:
                 if not preflight["git_available"]:
                     logger.warning("[EXECUTE] ⚠️ git不在 — difflibベースで安全弁を適用")
@@ -390,6 +393,7 @@ def _run_cycle_inner(
                     executor = GeminiExecutor(
                         model_name=model_name,
                         strong_model_name=strong_name,
+                        state=state,
                     )
                     context = build_execute_context(selected, state["scan_results"], workspace)
                     patch = executor.generate_patch(selected, context, workspace)
@@ -626,7 +630,7 @@ def _run_cycle_inner(
             "token_usage": state.get("token_usage", {}),
         }, cycle_id=state["cycle_id"])
 
-    return 1 if paused_now_flag else 0
+    return EXIT_PAUSED if paused_now_flag else EXIT_SUCCESS
 
 
 # ============================================================
@@ -635,7 +639,7 @@ def _run_cycle_inner(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="AGI Kernel — 自己改善ループ (v0.6.1)",
+        description="AGI Kernel — 自己改善ループ (v0.6.3)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(

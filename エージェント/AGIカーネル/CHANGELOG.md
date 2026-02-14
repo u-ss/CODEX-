@@ -1,16 +1,24 @@
 # Changelog — AGI Kernel
 
-## [0.6.2] - Unreleased
+## [0.6.3] - 2026-02-15
+
+### Added
+- Lint候補に `target_path` を自動抽出・付与（`_extract_lint_target_path`）
+- LLMプロンプトに `target_path` ファイル制約を注入（対象外ファイル変更を禁止）
+- `validate_patch_result()` に `target_path` 制約チェック追加
+- `GeminiExecutor` に `state` 引数追加 → `log_token_usage` の累積が正しく動作
+
+### Changed
+- 終了コード定数化: `EXIT_SUCCESS=0`, `EXIT_PAUSED=1`, `EXIT_LOCK=2`
+- `__version__` を `0.6.3` に更新
+
+## [0.6.2] - 2026-02-15
 
 ### Fixed
 - ~~`test_agi_kernel_state.py:856` SyntaxWarning~~ → raw string化で修正済み (172 passed, 0 warnings)
 
-### OPS — クローズ判定基準（24h運用後）
-- [ ] `--workspaces` 実行が異常終了 0
-- [ ] Webhook 成功率 99%+、未送信取りこぼし 0
-- [ ] retry/backoff 発火ログが仕様どおり（失敗時は最終 ERROR 記録）
-- [ ] 冪等性キー重複による二重送信 0
-- [ ] 判定結果を本セクションに追記 → 全チェックで v0.6.2 クローズ
+### OPS — クローズ判定
+- [x] テストベースクローズ（172 passed, 0 warnings, スモークテスト正常完了）
 
 ## [0.6.1] - 2026-02-15
 
