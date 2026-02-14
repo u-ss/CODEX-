@@ -1,9 +1,9 @@
 ---
-name: AGI Kernel v0.4.0
+name: AGI Kernel v0.5.0
 description: 自己改善ループ（AGIカーネル）— リポジトリスキャン・タスク生成・状態管理・学習記録
 ---
 
-# AGI Kernel SKILL v0.4.0
+# AGI Kernel SKILL v0.5.0
 
 **リポジトリの健全性を定期スキャンし、改善タスクを生成・実行・検証・記録する自己改善ループの技術仕様。**
 
@@ -27,7 +27,19 @@ AGI Kernelは1サイクルで以下を行う：
 
 > [!IMPORTANT]
 > **暴走防止**: 1サイクルで処理するタスクは**1つだけ**。
-> **安全弁**: 同一タスク3回失敗で `PAUSED` にして停止。
+> **安全弁**: 同一タスク3回失敗で `PAUSED` にして即停止（exit code 1）。
+> **v0.5.0**: auto_fixable判定により、修正不可能なタスクは自動スキップ。
+
+### v0.5.0 主要変更
+
+| 機能 | 説明 |
+|:-----|:-----|
+| **nodeid分割** | pytest失敗をnodeid単位で候補分割（精密な検証・修正） |
+| **auto_fixable判定** | `annotate_candidates()` で修正可否を判定。不可候補は `blocked_candidates` に分類 |
+| **select_taskフィルタ** | `auto_fixable=false` 候補は選択対象から除外 |
+| **環境ブロッカー** | preflight失敗はfailure_logに積まず即`PAUSED`+exit 1 |
+| **PAUSED即停止** | `record_failure()` が `paused_now=True` を返したら即停止 |
+| **report強化** | `blocked_candidates` + `no_fixable_candidates` reason を追加 |
 
 ---
 

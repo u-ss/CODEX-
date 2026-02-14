@@ -1,5 +1,5 @@
 ---
-name: AGI Kernel v0.4.0
+name: AGI Kernel v0.5.0
 description: 自己改善ループ（AGIカーネル）— リポジトリスキャン・タスク生成・状態管理・学習記録
 ---
 

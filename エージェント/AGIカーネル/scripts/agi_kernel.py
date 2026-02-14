@@ -368,6 +368,42 @@ def _extract_error_lines(lines: list[str], max_lines: int = 10) -> list[str]:
     return result
 
 
+# ── テスト失敗ノード抽出（nodeid単位分割用） ──
+_RE_FAILED_LINE = re.compile(
+    r"^FAILED\s+(.+?)\s*(?:-\s*.+)?$"
+)
+_RE_ERROR_LINE = re.compile(
+    r"^ERROR\s+(.+?)\s*(?:-\s*.+)?$"
+)
+
+
+def _extract_failure_nodes(lines: list[str], max_nodes: int = 30) -> list[dict]:
+    """FAILED / ERROR 行から nodeid と path を抽出する。
+
+    Returns:
+        [{"nodeid": "tests/test_foo.py::TestX::test_y", "path": "tests/test_foo.py"}, ...]
+    """
+    nodes: list[dict] = []
+    seen: set[str] = set()
+    for line in lines:
+        stripped = line.strip()
+        m = _RE_FAILED_LINE.match(stripped)
+        if not m:
+            m = _RE_ERROR_LINE.match(stripped)
+        if m:
+            nodeid = m.group(1).strip()
+            if nodeid in seen:
+                continue
+            seen.add(nodeid)
+            # path = nodeid の :: 前
+            path = nodeid.split("::")[0]
+            nodes.append({"nodeid": nodeid, "path": path})
+            if len(nodes) >= max_nodes:
+                break
+    return nodes
+
+
+
 # ── エラーブロック抽出（ファイル単位の収集エラー分割用） ──
 _RE_ERROR_COLLECTING = re.compile(
     r"ERROR\s+collecting\s+(.+?)(?:\s+|$)"
@@ -414,6 +450,7 @@ def _extract_error_blocks(lines: list[str], max_blocks: int = 20) -> list[dict]:
 
 
 def _stable_task_id(prefix: str, *parts: str) -> str:
+
     """安定したtask_idを生成する（sha1先頭10文字）。"""
     key = ":".join(parts)
     digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:10]
@@ -502,6 +539,9 @@ def parse_pytest_result(output: str, exit_code: int) -> dict[str, Any]:
     # error_blocks: ファイル単位のエラーブロック（収集エラー分割用）
     error_blocks = _extract_error_blocks(lines) if exit_code == 2 and lines else []
 
+    # failure_nodes: FAILED/ERROR行からnodeid単位で抽出（テスト失敗分割用）
+    failure_nodes = _extract_failure_nodes(lines) if exit_code == 1 and lines else []
+
     return {
         "available": True,
         "failures": failures,
@@ -513,6 +553,8 @@ def parse_pytest_result(output: str, exit_code: int) -> dict[str, Any]:
         "errors_count": errors_count,
         "error_lines": error_lines,
         "error_blocks": error_blocks,
+        # v0.5.0 追加
+        "failure_nodes": failure_nodes,
     }
 
 
@@ -605,6 +647,7 @@ def generate_candidates(scan_results: dict[str, Any]) -> list[dict[str, Any]]:
     pytest_failures = pytest_data.get("failures", 0)
     errors_count = pytest_data.get("errors_count", 0)
     error_blocks = pytest_data.get("error_blocks", [])
+    failure_nodes = pytest_data.get("failure_nodes", [])
 
     # 収集エラー: error_blocks があればファイル単位に分割
     if errors_count > 0 and error_blocks:
@@ -635,7 +678,24 @@ def generate_candidates(scan_results: dict[str, Any]) -> list[dict[str, Any]]:
             "estimated_effort": "medium",
         })
 
-    if pytest_failures > 0:
+    # v0.5.0: テスト失敗を nodeid 単位で分割
+    if pytest_failures > 0 and failure_nodes:
+        for node in failure_nodes:
+            nodeid = node["nodeid"]
+            path = node["path"]
+            task_id = _stable_task_id("pytest_tf", nodeid)
+            candidates.append({
+                "task_id": task_id,
+                "source": "pytest",
+                "priority": 2,
+                "title": f"テスト失敗修正: {nodeid[:80]}",
+                "description": f"FAILED {nodeid}",
+                "estimated_effort": "medium",
+                "target_path": path,
+                "target_nodeid": nodeid,
+            })
+    elif pytest_failures > 0:
+        # failure_nodes が取れないフォールバック（従来互換）
         description = _build_pytest_description(pytest_data)
         task_id = _stable_task_id("pytest_tf", str(pytest_failures))
         candidates.append({
@@ -661,12 +721,53 @@ def generate_candidates(scan_results: dict[str, Any]) -> list[dict[str, Any]]:
     return candidates
 
 
+# ── auto_fixable 判定用パターン ──
+_LINT_UNFIXABLE_PATTERNS = [
+    "missing skill.md",
+    "missing workflow.md",
+    "utf-8",
+    "decode",
+    "__pycache__",
+]
+
+
+def annotate_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """候補に auto_fixable / blocked_reason を付与する。
+
+    元のリストを変更して返す（コピーではない）。
+    """
+    for c in candidates:
+        source = c.get("source", "")
+        fixable = True
+        reason = ""
+
+        if source == "pytest":
+            # target_nodeid も target_path もない → 総当たり候補
+            if not c.get("target_nodeid") and not c.get("target_path"):
+                fixable = False
+                reason = "no_target_specified"
+        elif source == "workflow_lint":
+            desc_lower = c.get("description", "").lower()
+            for pattern in _LINT_UNFIXABLE_PATTERNS:
+                if pattern in desc_lower:
+                    fixable = False
+                    reason = f"unfixable_lint:{pattern}"
+                    break
+
+        c["auto_fixable"] = fixable
+        c["blocked_reason"] = reason
+    return candidates
+
+
 def select_task(
     candidates: list[dict[str, Any]],
     paused_tasks: list[str],
 ) -> Optional[dict[str, Any]]:
-    """候補から1つだけ選択する（PAUSEDを除外し優先度順）。"""
-    active = [c for c in candidates if c["task_id"] not in paused_tasks]
+    """候補から1つだけ選択する（PAUSED除外 + auto_fixable フィルタ + 優先度順）。"""
+    active = [
+        c for c in candidates
+        if c["task_id"] not in paused_tasks and c.get("auto_fixable", True)
+    ]
     if not active:
         return None
     active.sort(key=lambda c: c.get("priority", 99))
@@ -677,8 +778,12 @@ def select_task(
 # 失敗ログ管理
 # ============================================================
 
-def record_failure(state: dict, task_id: str, category: str, error: str) -> None:
-    """失敗をstateに記録し、3回超でPAUSEDにする。"""
+def record_failure(state: dict, task_id: str, category: str, error: str) -> bool:
+    """失敗をstateに記録し、3回でPAUSEDにする。
+
+    Returns:
+        bool: True = この呼び出しで paused_tasks に追加された（即停止すべき）
+    """
     # 既存エントリを探す
     entry = None
     for item in state["failure_log"]:
@@ -695,6 +800,9 @@ def record_failure(state: dict, task_id: str, category: str, error: str) -> None
 
     if entry["count"] >= MAX_TASK_FAILURES and task_id not in state["paused_tasks"]:
         state["paused_tasks"].append(task_id)
+        return True  # この瞬間に PAUSED 入り
+    return False
+
 
 
 # ============================================================
@@ -1196,7 +1304,11 @@ class Verifier:
         """
         source = task.get("source", "")
         target_path = task.get("target_path", "")
-        if source == "pytest" and target_path:
+        target_nodeid = task.get("target_nodeid", "")
+        if source == "pytest" and target_nodeid:
+            # v0.5.0: nodeid限定検証（最も狭い範囲）
+            cmd = [sys.executable, "-m", "pytest", target_nodeid, "-q", "--tb=short", "--color=no"]
+        elif source == "pytest" and target_path:
             # ターゲット限定検証
             cmd = [sys.executable, "-m", "pytest", target_path, "-q", "--tb=short", "--color=no"]
         elif source == "pytest":
@@ -1366,8 +1478,15 @@ def _run_cycle_inner(
         state["phase"] = "SENSE"
         candidates = generate_candidates(state["scan_results"])
         state["candidates"] = candidates
+        # v0.5.0: auto_fixable アノテーション
+        annotate_candidates(candidates)
         sm.save_candidates(candidates, date_str, state["cycle_id"])
         print(f"[SENSE] タスク候補: {len(candidates)}件")
+        blocked = [c for c in candidates if not c.get("auto_fixable", True)]
+        fixable = [c for c in candidates if c.get("auto_fixable", True)]
+        if blocked:
+            print(f"[SENSE] auto_fixable=false: {len(blocked)}件 (blocked)")
+        print(f"[SENSE] auto_fixable=true: {len(fixable)}件 (対処可能)")
         state["last_completed_phase"] = "SENSE"
         sm.save(state)  # SENSE checkpoint
     else:
@@ -1380,7 +1499,10 @@ def _run_cycle_inner(
         selected = select_task(candidates, state.get("paused_tasks", []))
         state["selected_task"] = selected
         if selected is None:
-            print("[SELECT] 対処可能なタスクがありません。サイクル完了。")
+            # v0.5.0: blocked候補の集計
+            blocked = [c for c in candidates if not c.get("auto_fixable", True)]
+            reason = "no_fixable_candidates" if blocked else "no_candidates"
+            print(f"[SELECT] 対処可能なタスクがありません（{reason}）。サイクル完了。")
             state["status"] = "COMPLETED"
             state["completed_at"] = datetime.now(JST).isoformat()
             state["phase"] = "CHECKPOINT"
@@ -1390,19 +1512,23 @@ def _run_cycle_inner(
             report = {
                 "cycle_id": state["cycle_id"],
                 "status": state["status"],
-                "reason": "no_candidates",
+                "reason": reason,
                 "scan_summary": {
                     "lint_errors": state["scan_results"].get("workflow_lint_errors", 0),
                     "pytest_errors": state["scan_results"].get("pytest_errors", 0),
                     "pytest_failures": state["scan_results"].get("pytest_failures", 0),
                 },
-                "candidates_count": 0,
+                "candidates_count": len(candidates),
+                "blocked_candidates": [
+                    {"task_id": c["task_id"], "title": c["title"], "blocked_reason": c.get("blocked_reason", "")}
+                    for c in blocked
+                ],
                 "selected_task": None,
                 "outcome": "SUCCESS",
                 "paused_tasks": state.get("paused_tasks", []),
             }
             report_path = sm.save_report(report, date_str, state["cycle_id"])
-            _record_ki("SUCCESS", cycle_id=state["cycle_id"], task_id="none", note="no_candidates")
+            _record_ki("SUCCESS", cycle_id=state["cycle_id"], task_id="none", note=reason)
             print(f"[CHECKPOINT] state保存完了: {sm.state_path}")
             print(f"[CHECKPOINT] レポート出力: {report_path}")
             return 0
@@ -1426,12 +1552,33 @@ def _run_cycle_inner(
             preflight = _preflight_check(workspace)
             if not preflight["ok"]:
                 reason = preflight["reason"]
-                print(f"[EXECUTE] ❌ Preflight失敗: {reason}")
-                state["execution_result"] = {
-                    "success": False,
-                    "error": f"preflight_failed: {reason}",
-                    "reason": reason,
+                print(f"[EXECUTE] ❌ Preflight失敗 (環境ブロッカー): {reason}")
+                # v0.5.0: 環境ブロッカーはfailure_logに積まず即PAUSED
+                state["status"] = "PAUSED"
+                state["completed_at"] = datetime.now(JST).isoformat()
+                state["phase"] = "CHECKPOINT"
+                state["last_completed_phase"] = "CHECKPOINT"
+                sm.save(state)
+                report = {
+                    "cycle_id": state["cycle_id"],
+                    "status": "PAUSED",
+                    "reason": f"blocked_by_{reason}",
+                    "scan_summary": {
+                        "lint_errors": state["scan_results"].get("workflow_lint_errors", 0),
+                        "pytest_errors": state["scan_results"].get("pytest_errors", 0),
+                        "pytest_failures": state["scan_results"].get("pytest_failures", 0),
+                    },
+                    "candidates_count": len(candidates),
+                    "selected_task": selected,
+                    "outcome": "BLOCKED",
+                    "paused_tasks": state.get("paused_tasks", []),
                 }
+                report_path = sm.save_report(report, date_str, state["cycle_id"])
+                _record_ki("FAILURE", cycle_id=state["cycle_id"],
+                           task_id=selected["task_id"] if selected else "none",
+                           note=f"env_blocker:{reason}")
+                print(f"[CHECKPOINT] レポート出力: {report_path}")
+                return 1  # 非0終了
             else:
                 if not preflight["git_available"]:
                     print("[EXECUTE] ⚠️ git不在 — difflibベースで安全弁を適用")
@@ -1585,13 +1732,13 @@ def _run_cycle_inner(
             # failure_log に記録
             error_msg = verify_result.get("output", "verification failed")[:500]
             category = classify_failure(error_msg)
-            record_failure(state, selected["task_id"], category, error_msg)
+            paused_now = record_failure(state, selected["task_id"], category, error_msg)
         else:
             outcome = "FAILURE"
             note = "execute_failed"
             error_msg = exec_result.get("error", "execute failed")[:500]
             category = classify_failure(error_msg)
-            record_failure(state, selected["task_id"], category, error_msg)
+            paused_now = record_failure(state, selected["task_id"], category, error_msg)
 
         _record_ki(
             outcome=outcome,
@@ -1615,6 +1762,7 @@ def _run_cycle_inner(
     state["completed_at"] = datetime.now(JST).isoformat()
     sm.save(state)
     # レポート出力
+    blocked = [c for c in candidates if not c.get("auto_fixable", True)]
     report = {
         "cycle_id": state["cycle_id"],
         "status": state["status"],
@@ -1624,6 +1772,10 @@ def _run_cycle_inner(
             "pytest_failures": state["scan_results"].get("pytest_failures", 0),
         },
         "candidates_count": len(candidates),
+        "blocked_candidates": [
+            {"task_id": c["task_id"], "title": c["title"], "blocked_reason": c.get("blocked_reason", "")}
+            for c in blocked
+        ],
         "selected_task": selected,
         "outcome": outcome,
         "paused_tasks": state.get("paused_tasks", []),
@@ -1631,6 +1783,13 @@ def _run_cycle_inner(
     report_path = sm.save_report(report, date_str, state["cycle_id"])
     print(f"[CHECKPOINT] state保存完了: {sm.state_path}")
     print(f"[CHECKPOINT] レポート出力: {report_path}")
+
+    # v0.5.0: タスクがPAUSED入りした瞬間は即停止
+    if locals().get("paused_now", False):
+        print(f"[CHECKPOINT] ⚠️ タスク {selected['task_id']} が {MAX_TASK_FAILURES}回失敗 → PAUSED停止")
+        state["status"] = "PAUSED"
+        sm.save(state)
+        return 1
     return 0
 
 

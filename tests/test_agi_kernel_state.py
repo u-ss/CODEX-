@@ -59,8 +59,10 @@ from agi_kernel import (
     _rollback_with_backup,
     _compute_patch_diff_lines,
     _extract_error_blocks,
+    _extract_failure_nodes,
     _stable_task_id,
     _restore_rollback_context,
+    annotate_candidates,
     Verifier,
     PHASE_ORDER,
     MAX_PATCH_FILES,
@@ -1252,3 +1254,281 @@ class TestRollbackAfterRestore:
         # ロールバック実行
         _rollback_with_backup(paths, bmap, workspace)
         assert target.read_text(encoding="utf-8") == "original"
+
+
+# ────────────────────────────────────────
+# v0.5.0 テスト
+# ────────────────────────────────────────
+
+class TestFailureNodes:
+    """項目1: _extract_failure_nodes のテスト"""
+
+    def test_extract_failed_lines(self):
+        lines = [
+            "FAILED tests/test_foo.py::TestFoo::test_bar - AssertionError",
+            "FAILED tests/test_baz.py::test_qux - RuntimeError",
+            "some other line",
+        ]
+        nodes = _extract_failure_nodes(lines)
+        assert len(nodes) == 2
+        assert nodes[0]["nodeid"] == "tests/test_foo.py::TestFoo::test_bar"
+        assert nodes[0]["path"] == "tests/test_foo.py"
+        assert nodes[1]["nodeid"] == "tests/test_baz.py::test_qux"
+        assert nodes[1]["path"] == "tests/test_baz.py"
+
+    def test_extract_error_lines_nodeid(self):
+        lines = [
+            "ERROR tests/test_x.py::test_y - TypeError",
+        ]
+        nodes = _extract_failure_nodes(lines)
+        assert len(nodes) == 1
+        assert nodes[0]["nodeid"] == "tests/test_x.py::test_y"
+
+    def test_deduplicate(self):
+        lines = [
+            "FAILED tests/test_a.py::test_1 - Error",
+            "FAILED tests/test_a.py::test_1 - Error",
+        ]
+        nodes = _extract_failure_nodes(lines)
+        assert len(nodes) == 1
+
+    def test_no_matches(self):
+        lines = ["all passed", "3 passed in 0.1s"]
+        nodes = _extract_failure_nodes(lines)
+        assert nodes == []
+
+    def test_max_nodes_limit(self):
+        lines = [f"FAILED tests/test_{i}.py::test_f - Err" for i in range(50)]
+        nodes = _extract_failure_nodes(lines, max_nodes=5)
+        assert len(nodes) == 5
+
+    def test_parse_pytest_result_includes_failure_nodes(self):
+        output = "\n".join([
+            "FAILED tests/test_a.py::test_x - AssertionError",
+            "FAILED tests/test_b.py::test_y - ValueError",
+            "2 failed in 1.00s",
+        ])
+        result = parse_pytest_result(output, exit_code=1)
+        assert len(result["failure_nodes"]) == 2
+        assert result["failure_nodes"][0]["path"] == "tests/test_a.py"
+
+    def test_failure_nodes_empty_on_exit_code_0(self):
+        output = "3 passed in 0.5s"
+        result = parse_pytest_result(output, exit_code=0)
+        assert result["failure_nodes"] == []
+
+
+class TestNodeidSplitting:
+    """項目2: generate_candidates の nodeid 分割テスト"""
+
+    def test_nodeid_split_candidates(self):
+        scan = {
+            "pytest": {
+                "exit_code": 1,
+                "failures": 2,
+                "errors_count": 0,
+                "error_blocks": [],
+                "failure_nodes": [
+                    {"nodeid": "tests/test_a.py::test_x", "path": "tests/test_a.py"},
+                    {"nodeid": "tests/test_b.py::test_y", "path": "tests/test_b.py"},
+                ],
+                "summary": "2 failed",
+            },
+        }
+        cands = generate_candidates(scan)
+        # 2つの候補が生成されるべき
+        pytest_cands = [c for c in cands if c["source"] == "pytest"]
+        assert len(pytest_cands) == 2
+        assert pytest_cands[0]["target_nodeid"] == "tests/test_a.py::test_x"
+        assert pytest_cands[0]["target_path"] == "tests/test_a.py"
+        assert pytest_cands[1]["target_nodeid"] == "tests/test_b.py::test_y"
+
+    def test_stable_task_id_from_nodeid(self):
+        scan = {
+            "pytest": {
+                "exit_code": 1,
+                "failures": 1,
+                "errors_count": 0,
+                "error_blocks": [],
+                "failure_nodes": [
+                    {"nodeid": "tests/test_a.py::test_x", "path": "tests/test_a.py"},
+                ],
+                "summary": "1 failed",
+            },
+        }
+        cands1 = generate_candidates(scan)
+        cands2 = generate_candidates(scan)
+        # 同じ入力なら同じtask_id
+        assert cands1[0]["task_id"] == cands2[0]["task_id"]
+
+    def test_fallback_when_no_failure_nodes(self):
+        scan = {
+            "pytest": {
+                "exit_code": 1,
+                "failures": 3,
+                "errors_count": 0,
+                "error_blocks": [],
+                "failure_nodes": [],
+                "summary": "3 failed",
+            },
+        }
+        cands = generate_candidates(scan)
+        pytest_cands = [c for c in cands if c["source"] == "pytest"]
+        # フォールバック: 1候補に丸め
+        assert len(pytest_cands) == 1
+        assert "target_nodeid" not in pytest_cands[0]
+
+
+class TestAutoFixable:
+    """項目3: annotate_candidates のテスト"""
+
+    def test_pytest_with_target_is_fixable(self):
+        cands = [
+            {"task_id": "t1", "source": "pytest", "target_path": "tests/test_a.py", "target_nodeid": "tests/test_a.py::test_x"},
+        ]
+        annotate_candidates(cands)
+        assert cands[0]["auto_fixable"] is True
+        assert cands[0]["blocked_reason"] == ""
+
+    def test_pytest_without_target_not_fixable(self):
+        cands = [
+            {"task_id": "t2", "source": "pytest"},
+        ]
+        annotate_candidates(cands)
+        assert cands[0]["auto_fixable"] is False
+        assert cands[0]["blocked_reason"] == "no_target_specified"
+
+    def test_lint_normal_is_fixable(self):
+        cands = [
+            {"task_id": "l1", "source": "workflow_lint", "description": "README missing version"},
+        ]
+        annotate_candidates(cands)
+        assert cands[0]["auto_fixable"] is True
+
+    def test_lint_missing_skill_not_fixable(self):
+        cands = [
+            {"task_id": "l2", "source": "workflow_lint", "description": "agent 'foo': missing SKILL.md"},
+        ]
+        annotate_candidates(cands)
+        assert cands[0]["auto_fixable"] is False
+        assert "skill.md" in cands[0]["blocked_reason"]
+
+    def test_lint_pycache_not_fixable(self):
+        cands = [
+            {"task_id": "l3", "source": "workflow_lint", "description": "agent '__pycache__': missing README.md"},
+        ]
+        annotate_candidates(cands)
+        assert cands[0]["auto_fixable"] is False
+        assert "__pycache__" in cands[0]["blocked_reason"]
+
+    def test_lint_utf8_not_fixable(self):
+        cands = [
+            {"task_id": "l4", "source": "workflow_lint", "description": "utf-8 decode failed"},
+        ]
+        annotate_candidates(cands)
+        assert cands[0]["auto_fixable"] is False
+
+    def test_mixed_candidates(self):
+        cands = [
+            {"task_id": "a", "source": "pytest", "target_path": "t.py", "target_nodeid": "t.py::test"},
+            {"task_id": "b", "source": "pytest"},
+            {"task_id": "c", "source": "workflow_lint", "description": "ok finding"},
+            {"task_id": "d", "source": "workflow_lint", "description": "__pycache__ issue"},
+        ]
+        annotate_candidates(cands)
+        assert cands[0]["auto_fixable"] is True
+        assert cands[1]["auto_fixable"] is False
+        assert cands[2]["auto_fixable"] is True
+        assert cands[3]["auto_fixable"] is False
+
+
+class TestSelectAutoFixable:
+    """項目4: select_task の auto_fixable フィルタテスト"""
+
+    def test_selects_only_fixable(self):
+        cands = [
+            {"task_id": "a", "priority": 1, "auto_fixable": False, "blocked_reason": "x"},
+            {"task_id": "b", "priority": 2, "auto_fixable": True, "blocked_reason": ""},
+        ]
+        selected = select_task(cands, [])
+        assert selected["task_id"] == "b"
+
+    def test_returns_none_if_all_blocked(self):
+        cands = [
+            {"task_id": "a", "priority": 1, "auto_fixable": False, "blocked_reason": "x"},
+            {"task_id": "b", "priority": 2, "auto_fixable": False, "blocked_reason": "y"},
+        ]
+        selected = select_task(cands, [])
+        assert selected is None
+
+    def test_returns_none_if_all_paused(self):
+        cands = [
+            {"task_id": "a", "priority": 1, "auto_fixable": True, "blocked_reason": ""},
+        ]
+        selected = select_task(cands, ["a"])
+        assert selected is None
+
+    def test_backward_compat_no_auto_fixable_key(self):
+        # auto_fixableが未付与でも従来互換（default=True）
+        cands = [
+            {"task_id": "a", "priority": 1},
+        ]
+        selected = select_task(cands, [])
+        assert selected["task_id"] == "a"
+
+
+class TestRecordFailurePaused:
+    """項目5: record_failure の paused_now 戻り値テスト"""
+
+    def test_returns_false_before_max(self):
+        state = {"failure_log": [], "paused_tasks": []}
+        result = record_failure(state, "t1", "deterministic", "error")
+        assert result is False
+        assert len(state["paused_tasks"]) == 0
+
+    def test_returns_true_at_max(self):
+        state = {"failure_log": [], "paused_tasks": []}
+        # MAX_TASK_FAILURES - 1 回呼ぶ
+        for _ in range(MAX_TASK_FAILURES - 1):
+            result = record_failure(state, "t1", "deterministic", "error")
+            assert result is False
+        # MAX_TASK_FAILURES 回目で True
+        result = record_failure(state, "t1", "deterministic", "error")
+        assert result is True
+        assert "t1" in state["paused_tasks"]
+
+    def test_returns_false_after_paused(self):
+        state = {"failure_log": [], "paused_tasks": []}
+        for _ in range(MAX_TASK_FAILURES):
+            record_failure(state, "t1", "deterministic", "error")
+        # すでにpaused済みの追加失敗はFalse
+        result = record_failure(state, "t1", "deterministic", "error")
+        assert result is False
+
+
+class TestVerifierNodeid:
+    """項目6: Verifier の target_nodeid 対応テスト"""
+
+    def test_nodeid_command_includes_nodeid(self, tmp_path):
+        v = Verifier(tmp_path)
+        task = {
+            "source": "pytest",
+            "target_path": "tests/test_a.py",
+            "target_nodeid": "tests/test_a.py::TestFoo::test_bar",
+        }
+        # verifyを実行せずコマンド生成ロジックだけテスト
+        # Verifier.verify内のcmd構築ロジックを、関数を直接呼んで確認
+        result = v.verify(task)
+        # nodeidがコマンドに含まれているか確認
+        assert "tests/test_a.py::TestFoo::test_bar" in result["command"]
+
+    def test_target_path_fallback(self, tmp_path):
+        v = Verifier(tmp_path)
+        task = {
+            "source": "pytest",
+            "target_path": "tests/test_a.py",
+        }
+        result = v.verify(task)
+        assert "tests/test_a.py" in result["command"]
+        assert "::" not in result["command"]
+
