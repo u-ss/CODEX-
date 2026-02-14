@@ -1014,11 +1014,16 @@ def _validate_patch_result(patch: dict, workspace: Path) -> None:
         path_str = f.get("path", "")
         if not path_str:
             raise ValueError("path が空です")
-        # パス安全検証: .. 禁止、workspace 配下であること
-        if ".." in path_str:
+        # パス安全検証: トラバーサル禁止、workspace 配下であること
+        # os.sep で分割して「..」コンポーネントを検出（foo..bar.py 等の誤検出防止）
+        path_parts = Path(path_str).parts
+        if ".." in path_parts:
             raise ValueError(f"path に '..' が含まれています: {path_str}")
         resolved = (workspace / path_str).resolve()
-        if not str(resolved).startswith(str(ws_resolved)):
+        # Path.is_relative_to で原子的に検証（startswith文字列比較の回避）
+        try:
+            resolved.relative_to(ws_resolved)
+        except ValueError:
             raise ValueError(f"path がワークスペース外です: {path_str}")
         action = f.get("action", "")
         if action not in ("create", "modify"):
@@ -1758,10 +1763,18 @@ def _run_cycle_inner(
     # ── CHECKPOINT ──
     state["phase"] = "CHECKPOINT"
     state["last_completed_phase"] = "CHECKPOINT"
-    state["status"] = "COMPLETED"
     state["completed_at"] = datetime.now(JST).isoformat()
+
+    # v0.5.1: paused_now 判定をreport生成前に実行し、statusを正確に反映
+    paused_now_flag = locals().get("paused_now", False)
+    if paused_now_flag:
+        state["status"] = "PAUSED"
+        print(f"[CHECKPOINT] ⚠️ タスク {selected['task_id']} が {MAX_TASK_FAILURES}回失敗 → PAUSED停止")
+    else:
+        state["status"] = "COMPLETED"
     sm.save(state)
-    # レポート出力
+
+    # レポート出力（state.status と一致した状態で生成）
     blocked = [c for c in candidates if not c.get("auto_fixable", True)]
     report = {
         "cycle_id": state["cycle_id"],
@@ -1784,13 +1797,7 @@ def _run_cycle_inner(
     print(f"[CHECKPOINT] state保存完了: {sm.state_path}")
     print(f"[CHECKPOINT] レポート出力: {report_path}")
 
-    # v0.5.0: タスクがPAUSED入りした瞬間は即停止
-    if locals().get("paused_now", False):
-        print(f"[CHECKPOINT] ⚠️ タスク {selected['task_id']} が {MAX_TASK_FAILURES}回失敗 → PAUSED停止")
-        state["status"] = "PAUSED"
-        sm.save(state)
-        return 1
-    return 0
+    return 1 if paused_now_flag else 0
 
 
 # ============================================================
