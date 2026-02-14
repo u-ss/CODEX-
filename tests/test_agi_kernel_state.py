@@ -58,6 +58,9 @@ from agi_kernel import (
     _backup_targets,
     _rollback_with_backup,
     _compute_patch_diff_lines,
+    _extract_error_blocks,
+    _stable_task_id,
+    _restore_rollback_context,
     Verifier,
     PHASE_ORDER,
     MAX_PATCH_FILES,
@@ -426,8 +429,9 @@ class TestCandidateSelection:
         candidates = generate_candidates(scan)
         assert len(candidates) >= 1
         pytest_cand = [c for c in candidates if c["source"] == "pytest"]
-        assert len(pytest_cand) == 1
-        assert pytest_cand[0]["task_id"] == "pytest_exit_2"
+        assert len(pytest_cand) >= 1
+        # v0.4.0: stable_id形式
+        assert pytest_cand[0]["task_id"].startswith("pytest_")
 
     def test_generate_candidates_pytest_exit0_no_candidate(self):
         """exit_code=0 かつ failures=0 → pytest候補なし。"""
@@ -440,7 +444,7 @@ class TestCandidateSelection:
         assert len(pytest_cand) == 0
 
     def test_generate_candidates_pytest_exit1_with_failures(self):
-        """exit_code=1, failures=3 → 安定IDが pytest_exit_1。"""
+        """exit_code=1, failures=3 → stable_idが pytest_tf_ 形式。"""
         scan = {
             "workflow_lint": {"errors": 0, "findings": []},
             "pytest": {"failures": 3, "exit_code": 1, "summary": "3 failed, 10 passed"},
@@ -448,7 +452,8 @@ class TestCandidateSelection:
         candidates = generate_candidates(scan)
         pytest_cand = [c for c in candidates if c["source"] == "pytest"]
         assert len(pytest_cand) == 1
-        assert pytest_cand[0]["task_id"] == "pytest_exit_1"
+        # v0.4.0: stable_id形式
+        assert pytest_cand[0]["task_id"].startswith("pytest_tf_")
 
 
 # ────────────────────────────────────────
@@ -1035,3 +1040,215 @@ class TestComputePatchDiffLines:
         bmap = {"same.py": bak}
         assert _compute_patch_diff_lines(patch, bmap) == 0
 
+
+# ────────────────────────────────────────
+# v0.4.0 テスト: error_blocks / stable_id / restore
+# ────────────────────────────────────────
+
+class TestExtractErrorBlocks:
+    """収集エラーのファイル単位分割テスト。"""
+
+    def test_two_collection_errors(self):
+        """複数のERROR collectingがブロックに分割される。"""
+        lines = [
+            "ERROR collecting tests/test_foo.py",
+            "E   ModuleNotFoundError: No module named 'foo'",
+            "",
+            "ERROR collecting tests/test_bar.py",
+            "E   ImportError: cannot import name 'bar'",
+        ]
+        blocks = _extract_error_blocks(lines)
+        assert len(blocks) == 2
+        assert blocks[0]["path"] == "tests/test_foo.py"
+        assert "ModuleNotFoundError" in blocks[0]["exception_line"]
+        assert blocks[1]["path"] == "tests/test_bar.py"
+        assert "ImportError" in blocks[1]["exception_line"]
+
+    def test_no_errors(self):
+        """エラーなしは空リスト。"""
+        lines = ["5 passed in 1.23s"]
+        assert _extract_error_blocks(lines) == []
+
+    def test_max_blocks(self):
+        """上限制限。"""
+        lines = []
+        for i in range(25):
+            lines.append(f"ERROR collecting tests/test_{i}.py")
+            lines.append(f"E   SomeError: error {i}")
+            lines.append("")
+        blocks = _extract_error_blocks(lines, max_blocks=5)
+        assert len(blocks) == 5
+
+    def test_no_exception_line(self):
+        """E行がないERROR collecting。"""
+        lines = ["ERROR collecting tests/test_x.py"]
+        blocks = _extract_error_blocks(lines)
+        assert len(blocks) == 1
+        assert blocks[0]["path"] == "tests/test_x.py"
+        assert blocks[0]["exception_line"] == ""
+
+
+class TestStableTaskId:
+    """安定task_idテスト。"""
+
+    def test_deterministic(self):
+        """同じ入力は同じID。"""
+        id1 = _stable_task_id("lint", "some error")
+        id2 = _stable_task_id("lint", "some error")
+        assert id1 == id2
+        assert id1.startswith("lint_")
+        # sha1先頭10文字 + prefix
+        assert len(id1) == len("lint_") + 10
+
+    def test_different_inputs(self):
+        """異なる入力は異なるID。"""
+        id1 = _stable_task_id("pytest_ce", "tests/foo.py", "ImportError")
+        id2 = _stable_task_id("pytest_ce", "tests/bar.py", "ImportError")
+        assert id1 != id2
+
+
+class TestCandidateSplitting:
+    """収集エラー候補分割テスト。"""
+
+    def test_collection_errors_split_to_multiple_candidates(self):
+        """複数収集エラーが複数候補になる。"""
+        output = (
+            "ERROR collecting tests/test_a.py\n"
+            "E   ModuleNotFoundError: No module named 'a'\n"
+            "\n"
+            "ERROR collecting tests/test_b.py\n"
+            "E   ImportError: cannot import name 'b'\n"
+            "\n"
+            "2 errors in 1.00s\n"
+        )
+        result = parse_pytest_result(output, 2)
+        assert result["exit_code"] == 2
+        assert result["errors_count"] == 2
+        assert result["failures"] == 0  # 補正されない
+        assert len(result["error_blocks"]) == 2
+
+        scan = {"pytest": result, "workflow_lint": {"findings": []}}
+        candidates = generate_candidates(scan)
+        assert len(candidates) == 2
+        assert candidates[0]["target_path"] == "tests/test_a.py"
+        assert candidates[1]["target_path"] == "tests/test_b.py"
+        # stable_idが一貫している
+        assert candidates[0]["task_id"].startswith("pytest_ce_")
+
+    def test_test_failure_stable_id(self):
+        """テスト失敗のstable_id。"""
+        output = "3 failed, 2 passed in 5.00s\n"
+        result = parse_pytest_result(output, 1)
+        assert result["failures"] == 3
+        assert result["errors_count"] == 0
+
+        scan = {"pytest": result, "workflow_lint": {"findings": []}}
+        candidates = generate_candidates(scan)
+        assert len(candidates) == 1
+        assert candidates[0]["task_id"].startswith("pytest_tf_")
+
+    def test_lint_stable_id(self):
+        """同じlint findingsは同じtask_id。"""
+        scan = {
+            "pytest": {"exit_code": 0, "failures": 0},
+            "workflow_lint": {"findings": ["[ERROR] missing SKILL.md"]},
+        }
+        c1 = generate_candidates(scan)
+        c2 = generate_candidates(scan)
+        assert c1[0]["task_id"] == c2[0]["task_id"]
+
+    def test_collection_error_fallback(self):
+        """error_blocksなしのフォールバック。"""
+        output = "5 errors in 2.00s\n"
+        result = parse_pytest_result(output, 2)
+        assert result["errors_count"] == 5
+        assert result["error_blocks"] == []
+
+        scan = {"pytest": result, "workflow_lint": {"findings": []}}
+        candidates = generate_candidates(scan)
+        assert len(candidates) == 1
+        assert candidates[0]["task_id"].startswith("pytest_ce_")
+        assert "5件" in candidates[0]["title"]
+
+
+class TestRestoreRollbackContext:
+    """RESUME時のロールバックコンテキスト復元テスト。"""
+
+    def test_restore_with_backup(self, tmp_path: Path):
+        """バックアップが存在する場合の復元。"""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        output_dir = tmp_path / "out"
+        backup_dir = output_dir / "20260214" / "cycle1" / "backup"
+        backup_dir.mkdir(parents=True)
+        # バックアップファイル作成
+        (backup_dir / "hello.py").write_text("original", encoding="utf-8")
+
+        state = {
+            "execution_result": {
+                "success": True,
+                "modified_files": ["hello.py"],
+                "backup_dir": "20260214/cycle1/backup",
+            }
+        }
+        paths, bmap = _restore_rollback_context(state, workspace, output_dir)
+        assert len(paths) == 1
+        assert paths[0] == workspace / "hello.py"
+        assert bmap["hello.py"] == backup_dir / "hello.py"
+
+    def test_restore_new_file(self, tmp_path: Path):
+        """新規ファイル（バックアップなし）の復元。"""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        output_dir = tmp_path / "out"
+        backup_dir = output_dir / "20260214" / "cycle1" / "backup"
+        backup_dir.mkdir(parents=True)
+        state = {
+            "execution_result": {
+                "success": True,
+                "modified_files": ["new_file.py"],
+                "backup_dir": "20260214/cycle1/backup",
+            }
+        }
+        paths, bmap = _restore_rollback_context(state, workspace, output_dir)
+        assert len(paths) == 1
+        assert bmap["new_file.py"] is None  # 新規ファイルはNone
+
+    def test_restore_empty_state(self, tmp_path: Path):
+        """ステートに情報がない場合。"""
+        state = {"execution_result": {"success": True}}
+        paths, bmap = _restore_rollback_context(
+            state, tmp_path / "ws", tmp_path / "out",
+        )
+        assert paths == []
+        assert bmap == {}
+
+
+class TestRollbackAfterRestore:
+    """RESUME後のロールバック統合テスト。"""
+
+    def test_rollback_restores_original(self, tmp_path: Path):
+        """復元したcontextでロールバックすると元に戻る。"""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        output_dir = tmp_path / "out"
+        backup_dir = output_dir / "20260214" / "cycle1" / "backup"
+        backup_dir.mkdir(parents=True)
+
+        # バックアップ: 元の内容
+        (backup_dir / "target.py").write_text("original", encoding="utf-8")
+        # 変更後のファイル
+        target = workspace / "target.py"
+        target.write_text("modified_by_llm", encoding="utf-8")
+
+        state = {
+            "execution_result": {
+                "success": True,
+                "modified_files": ["target.py"],
+                "backup_dir": "20260214/cycle1/backup",
+            }
+        }
+        paths, bmap = _restore_rollback_context(state, workspace, output_dir)
+        # ロールバック実行
+        _rollback_with_backup(paths, bmap, workspace)
+        assert target.read_text(encoding="utf-8") == "original"

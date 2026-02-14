@@ -1,9 +1,9 @@
 ---
-name: AGI Kernel v0.2.0
+name: AGI Kernel v0.4.0
 description: 自己改善ループ（AGIカーネル）— リポジトリスキャン・タスク生成・状態管理・学習記録
 ---
 
-# AGI Kernel SKILL v0.2.0
+# AGI Kernel SKILL v0.4.0
 
 **リポジトリの健全性を定期スキャンし、改善タスクを生成・実行・検証・記録する自己改善ループの技術仕様。**
 
@@ -212,24 +212,22 @@ from workflow_logging_hook import run_logged_main
 ### v0.3.1 EXECUTE/VERIFY 安全強化ルール
 
 - **Executor抽象**: `Executor` ABCで差し替え可能（現在: `GeminiExecutor`）
-- **GeminiExecutor**: `gemini-2.5-flash`（デフォルト）/ `gemini-2.5-pro` 切替可能
-- **環境変数**: `GOOGLE_API_KEY` 必須（未設定時はRuntimeError）
+- **環境変数**: `GOOGLE_API_KEY` / `GEMINI_API_KEY` どちらかで動作
 - **Preflight**: `_preflight_check` — EXECUTE前にgit状態チェック
-  - dirty_worktree → EXECUTE中止・FAILURE扱い
-  - git不在 → difflibベースで安全弁適用（続行可能）
-- **パッチ安全検証**: `_validate_patch_result` — `..`禁止、workspace配下のみ、action限定
 - **バックアップ復元**: `_backup_targets` → `_rollback_with_backup`
-  - 適用前にバックアップ作成 → 失敗時はバックアップから復元（ファイル削除事故防止）
-  - 新規ファイルのみ削除、既存ファイルは常に復元
 - **diff検証**: `_compute_patch_diff_lines` — difflib ベース（git非依存）
-  - バックアップ vs 新内容で純粋なサイクル差分を計算
-  - 累積差分問題を完全解消
-- **安全制限定数**:
-  - `MAX_PATCH_FILES = 5` — 1回のパッチで変更可能な最大ファイル数
-  - `MAX_DIFF_LINES = 200` — 1回のパッチの最大diff行数
-  - `MAX_LLM_RETRIES = 3` — バリデーション失敗時の最大リトライ
-- **auto-commit**: `--auto-commit` フラグ（デフォルトOFF）
-  - VERIFY成功時: git add + git commit を自動実行
-  - フラグなし + git環境: 「手動commit推奨」警告を表示
-- **Verifier**: タスク種別に応じた最小コマンド実行（pytest / workflow_lint）
-- **outcome判定**: VERIFY結果で `SUCCESS` / `FAILURE` / `PARTIAL` を分岐
+- **安全制限定数**: `MAX_PATCH_FILES=5`, `MAX_DIFF_LINES=200`, `MAX_LLM_RETRIES=3`
+
+### v0.4.0 候補分割・RESUME安全性・LLMフォールバック
+
+- **pytest候補分割**: 収集エラーをファイル単位に分割して候補化（`_extract_error_blocks`）
+  - 各候補に `target_path` を付与（VERIFYターゲット限定に使用）
+- **SCAN `--tb=short`**: 原因行（E行）を拾えるように変更
+- **Stable task_id**: `_stable_task_id(prefix, *parts)` — sha1先頭10文字で安定過去一致
+  - PAUSEDのズレを防止
+- **EXECUTE状態永続化**: `modified_files` / `backup_dir` を state.json に保存
+  - `_restore_u rollback_context` でRESUME後も復元可能
+- **LLMフォールバック**: flashでMAX_LLM_RETRIES失敗 → proで再試行
+  - CLI: `--llm-model`, `--llm-strong-model` / env: `AGI_KERNEL_LLM_MODEL`, `AGI_KERNEL_LLM_STRONG_MODEL`
+- **VERIFYターゲット限定**: `target_path` がある候補は `pytest <target_path>` で検証
+- **auto-commitバグ修正**: `selected.get("id")` → `selected.get("task_id")` に修正

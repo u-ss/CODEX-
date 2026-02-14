@@ -13,11 +13,12 @@ AGI Kernel — 自己改善ループ MVP
 
 from __future__ import annotations
 import difflib
+import hashlib
 import re
 from abc import ABC, abstractmethod
 import textwrap
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 import argparse
 import json
@@ -356,6 +357,58 @@ def _extract_error_lines(lines: list[str], max_lines: int = 10) -> list[str]:
     return result
 
 
+# ── エラーブロック抽出（ファイル単位の収集エラー分割用） ──
+_RE_ERROR_COLLECTING = re.compile(
+    r"ERROR\s+collecting\s+(.+?)(?:\s+|$)"
+)
+
+
+def _extract_error_blocks(lines: list[str], max_blocks: int = 20) -> list[dict]:
+    """ERROR collecting 行をファイル単位でブロック化する。
+
+    各ブロック: {"path": str, "exception_line": str, "snippet": list[str]}
+    """
+    blocks: list[dict] = []
+    i = 0
+    while i < len(lines) and len(blocks) < max_blocks:
+        stripped = lines[i].strip()
+        m = _RE_ERROR_COLLECTING.match(stripped)
+        if m:
+            path = m.group(1).strip()
+            exception_line = ""
+            snippet = [stripped]
+            # 直後のE行を収集
+            j = i + 1
+            while j < len(lines):
+                next_line = lines[j].strip()
+                if next_line.startswith("E   "):
+                    snippet.append(next_line)
+                    if not exception_line:
+                        exception_line = next_line
+                    j += 1
+                elif next_line.startswith("ERROR") or not next_line:
+                    break
+                else:
+                    snippet.append(next_line)
+                    j += 1
+            blocks.append({
+                "path": path,
+                "exception_line": exception_line,
+                "snippet": snippet[:8],  # スニペット最大8行
+            })
+            i = j
+        else:
+            i += 1
+    return blocks
+
+
+def _stable_task_id(prefix: str, *parts: str) -> str:
+    """安定したtask_idを生成する（sha1先頭10文字）。"""
+    key = ":".join(parts)
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:10]
+    return f"{prefix}_{digest}"
+
+
 def _find_summary_line(lines: list[str]) -> str:
     """末尾から逆走査して結果行を探す。warningsではなくpassed/failed/error行を優先。"""
     # 末尾から逆走査し、結果キーワードを含む行を探す
@@ -435,6 +488,9 @@ def parse_pytest_result(output: str, exit_code: int) -> dict[str, Any]:
     # error_lines: ERROR/E行を最大10行
     error_lines = _extract_error_lines(lines)
 
+    # error_blocks: ファイル単位のエラーブロック（収集エラー分割用）
+    error_blocks = _extract_error_blocks(lines) if exit_code == 2 and lines else []
+
     return {
         "available": True,
         "failures": failures,
@@ -445,6 +501,7 @@ def parse_pytest_result(output: str, exit_code: int) -> dict[str, Any]:
         "headline": headline,
         "errors_count": errors_count,
         "error_lines": error_lines,
+        "error_blocks": error_blocks,
     }
 
 
@@ -488,7 +545,7 @@ class Scanner:
         """pytestを実行し結果を返す。"""
         try:
             result = subprocess.run(
-                [sys.executable, "-m", "pytest", "-q", "--tb=no", "--color=no"],
+                [sys.executable, "-m", "pytest", "-q", "--tb=short", "--color=no"],
                 capture_output=True, text=True, timeout=120,
                 cwd=str(self.workspace),
             )
@@ -519,11 +576,12 @@ def _build_pytest_description(pytest_data: dict[str, Any]) -> str:
 def generate_candidates(scan_results: dict[str, Any]) -> list[dict[str, Any]]:
     """スキャン結果からタスク候補を生成する。"""
     candidates = []
-    # workflow_lint の ERROR → 優先度1
+    # workflow_lint の ERROR → 優先度1（stable_id使用）
     lint_data = scan_results.get("workflow_lint", {})
-    for i, finding in enumerate(lint_data.get("findings", [])):
+    for finding in lint_data.get("findings", []):
+        task_id = _stable_task_id("lint", finding[:200])
         candidates.append({
-            "task_id": f"lint_{i:03d}",
+            "task_id": task_id,
             "source": "workflow_lint",
             "priority": 1,
             "title": f"Lint修正: {finding[:80]}",
@@ -535,36 +593,57 @@ def generate_candidates(scan_results: dict[str, Any]) -> list[dict[str, Any]]:
     pytest_exit = pytest_data.get("exit_code", 0)
     pytest_failures = pytest_data.get("failures", 0)
     errors_count = pytest_data.get("errors_count", 0)
-    description = _build_pytest_description(pytest_data)
+    error_blocks = pytest_data.get("error_blocks", [])
 
-    if errors_count > 0:
-        title = f"収集エラー修正 ({errors_count}件)"
+    # 収集エラー: error_blocks があればファイル単位に分割
+    if errors_count > 0 and error_blocks:
+        for blk in error_blocks:
+            path = blk["path"]
+            exc = blk.get("exception_line", "")
+            task_id = _stable_task_id("pytest_ce", path, exc)
+            snippet_desc = "\n".join(blk.get("snippet", []))
+            candidates.append({
+                "task_id": task_id,
+                "source": "pytest",
+                "priority": 2,
+                "title": f"収集エラー修正: {path}",
+                "description": snippet_desc[:800],
+                "estimated_effort": "medium",
+                "target_path": path,
+            })
+    elif errors_count > 0:
+        # error_blocks が取れないフォールバック
+        description = _build_pytest_description(pytest_data)
+        task_id = _stable_task_id("pytest_ce", str(errors_count))
         candidates.append({
-            "task_id": f"pytest_exit_{pytest_exit}",
+            "task_id": task_id,
             "source": "pytest",
             "priority": 2,
-            "title": title,
+            "title": f"収集エラー修正 ({errors_count}件)",
             "description": description,
             "estimated_effort": "medium",
         })
+
     if pytest_failures > 0:
-        title = f"テスト失敗修正 ({pytest_failures}件)"
+        description = _build_pytest_description(pytest_data)
+        task_id = _stable_task_id("pytest_tf", str(pytest_failures))
         candidates.append({
-            "task_id": f"pytest_exit_{pytest_exit}",
+            "task_id": task_id,
             "source": "pytest",
             "priority": 2,
-            "title": title,
+            "title": f"テスト失敗修正 ({pytest_failures}件)",
             "description": description,
             "estimated_effort": "medium",
         })
     elif pytest_exit not in (0, None) and pytest_exit != -1 and errors_count == 0:
         # errors_countもfailuresも取れない異常終了
-        title = f"pytest異常終了 (exit_code={pytest_exit})"
+        description = _build_pytest_description(pytest_data)
+        task_id = _stable_task_id("pytest_unk", str(pytest_exit))
         candidates.append({
-            "task_id": f"pytest_exit_{pytest_exit}",
+            "task_id": task_id,
             "source": "pytest",
             "priority": 2,
-            "title": title,
+            "title": f"pytest異常終了 (exit_code={pytest_exit})",
             "description": description,
             "estimated_effort": "medium",
         })
@@ -636,9 +715,10 @@ def _get_genai():
         import google.generativeai as genai
         import warnings
         warnings.filterwarnings("ignore", category=FutureWarning)
-        api_key = os.environ.get("GOOGLE_API_KEY", "")
+        # GOOGLE_API_KEY または GEMINI_API_KEY を使用（互換）
+        api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY", "")
         if not api_key:
-            raise RuntimeError("環境変数 GOOGLE_API_KEY が未設定です")
+            raise RuntimeError("環境変数 GOOGLE_API_KEY / GEMINI_API_KEY が未設定です")
         genai.configure(api_key=api_key)
         return genai
     except ImportError:
@@ -699,25 +779,35 @@ _PATCH_PROMPT_TEMPLATE = textwrap.dedent("""\
 
 
 class GeminiExecutor(Executor):
-    """Gemini API でパッチを生成する実装。"""
+    """Gemini API でパッチを生成する実装。flash→proフォールバック付き。"""
 
-    def __init__(self, model_name: str = "gemini-2.5-flash"):
-        self.model_name = model_name
+    def __init__(
+        self,
+        model_name: str = "gemini-2.5-flash",
+        strong_model_name: str = "gemini-2.5-pro",
+    ):
+        self.model_name = (
+            os.environ.get("AGI_KERNEL_LLM_MODEL") or model_name
+        )
+        self.strong_model_name = (
+            os.environ.get("AGI_KERNEL_LLM_STRONG_MODEL") or strong_model_name
+        )
 
     def generate_patch(self, task: dict, context: str, workspace: Path) -> dict:
-        """Gemini API でパッチを生成し、バリデーション済みdictを返す。"""
+        """Gemini API でパッチを生成し、バリデーション済dictを返す。"""
         genai = _get_genai()
-        model = genai.GenerativeModel(self.model_name)
 
         prompt = _PATCH_PROMPT_TEMPLATE.format(
             title=task.get("title", ""),
             description=task.get("description", ""),
             source=task.get("source", ""),
-            context=context[:3000],  # コンテキストは3000文字まで
+            context=context[:3000],
             max_files=MAX_PATCH_FILES,
         )
 
+        # フェーズ1: 通常モデルで試行
         last_error = ""
+        model = genai.GenerativeModel(self.model_name)
         for attempt in range(MAX_LLM_RETRIES):
             try:
                 response = model.generate_content(prompt)
@@ -734,7 +824,27 @@ class GeminiExecutor(Executor):
                 print(f"[EXECUTE] LLM呼び出しエラー (attempt {attempt+1}/{MAX_LLM_RETRIES}): {e}")
                 continue
 
-        raise RuntimeError(f"LLMパッチ生成に{MAX_LLM_RETRIES}回失敗: {last_error}")
+        # フェーズ2: 強力モデルでフォールバック
+        if self.strong_model_name != self.model_name:
+            print(f"[EXECUTE] → 強力モデル({self.strong_model_name})でフォールバック...")
+            strong_model = genai.GenerativeModel(self.strong_model_name)
+            for attempt in range(MAX_LLM_RETRIES):
+                try:
+                    response = strong_model.generate_content(prompt)
+                    raw = response.text
+                    patch = _parse_patch_json(raw)
+                    _validate_patch_result(patch, workspace)
+                    return patch
+                except (json.JSONDecodeError, ValueError, KeyError) as e:
+                    last_error = str(e)
+                    print(f"[EXECUTE] 強力モデルバリデーション失敗 (attempt {attempt+1}/{MAX_LLM_RETRIES}): {e}")
+                    continue
+                except Exception as e:
+                    last_error = str(e)
+                    print(f"[EXECUTE] 強力モデルエラー (attempt {attempt+1}/{MAX_LLM_RETRIES}): {e}")
+                    continue
+
+        raise RuntimeError(f"LLMパッチ生成に失敗: {last_error}")
 
 
 def _parse_patch_json(raw: str) -> dict:
@@ -905,6 +1015,33 @@ def _rollback_with_backup(
                 p.unlink()
 
 
+def _restore_rollback_context(
+    state: dict, workspace: Path, output_dir: Path,
+) -> tuple[list[Path], dict[str, Optional[Path]]]:
+    """ステートからmodified_pathsとbackup_mapを復元する（RESUME安全性）。
+
+    EXECUTE後にプロセスが落ちても、state.jsonから
+    ロールバックに必要な情報を復元できる。
+    """
+    exec_result = state.get("execution_result", {})
+    modified_files = exec_result.get("modified_files", [])
+    backup_dir_rel = exec_result.get("backup_dir", "")
+
+    modified_paths = [workspace / f for f in modified_files]
+    backup_map: dict[str, Optional[Path]] = {}
+
+    if backup_dir_rel:
+        backup_dir = output_dir / backup_dir_rel
+        for rel in modified_files:
+            bak = backup_dir / rel
+            if bak.exists():
+                backup_map[rel] = bak
+            else:
+                backup_map[rel] = None  # 新規ファイル扱い
+
+    return modified_paths, backup_map
+
+
 def _compute_patch_diff_lines(
     patch: dict, backup_map: dict[str, Optional[Path]],
 ) -> int:
@@ -975,14 +1112,17 @@ class Verifier:
             {"success": bool, "exit_code": int, "output": str, "command": str}
         """
         source = task.get("source", "")
-        if source == "pytest":
+        target_path = task.get("target_path", "")
+        if source == "pytest" and target_path:
+            # ターゲット限定検証
+            cmd = [sys.executable, "-m", "pytest", target_path, "-q", "--tb=short", "--color=no"]
+        elif source == "pytest":
             cmd = [sys.executable, "-m", "pytest", "-q", "--tb=short", "--color=no"]
         elif source == "workflow_lint":
             lint_script = self.workspace / "tools" / "workflow_lint.py"
             if lint_script.exists():
                 cmd = [sys.executable, str(lint_script)]
             else:
-                # lint スクリプトなし → pytest で代替
                 cmd = [sys.executable, "-m", "pytest", "-q", "--tb=short", "--color=no"]
         else:
             cmd = [sys.executable, "-m", "pytest", "-q", "--tb=short", "--color=no"]
@@ -1216,7 +1356,13 @@ def _run_cycle_inner(
                 # ── LLMパッチ生成→バックアップ→適用→diff検証 ──
                 print("[EXECUTE] LLMパッチ生成を開始...")
                 try:
-                    executor = GeminiExecutor(model_name="gemini-2.5-flash")
+                    # CLIフラグでモデルを指定可能
+                    model_name = getattr(args, "llm_model", None) or "gemini-2.5-flash"
+                    strong_name = getattr(args, "llm_strong_model", None) or "gemini-2.5-pro"
+                    executor = GeminiExecutor(
+                        model_name=model_name,
+                        strong_model_name=strong_name,
+                    )
                     context = _build_execute_context(selected, state["scan_results"])
                     patch = executor.generate_patch(selected, context, workspace)
                     print(f"[EXECUTE] パッチ生成完了: {len(patch['files'])}ファイル")
@@ -1251,6 +1397,14 @@ def _run_cycle_inner(
                             "diff_lines": diff_lines,
                             "patch_explanation": patch.get("explanation", ""),
                             "git_available": preflight["git_available"],
+                            # RESUME安全性: ロールバック情報を永続化
+                            "modified_files": [
+                                str(p.relative_to(workspace)).replace("\\", "/")
+                                for p in modified_paths
+                            ],
+                            "backup_dir": str(
+                                backup_dir.relative_to(output_dir)
+                            ).replace("\\", "/"),
                         }
                 except RuntimeError as e:
                     print(f"[EXECUTE] エラー: {e}")
@@ -1275,22 +1429,27 @@ def _run_cycle_inner(
         state["phase"] = "VERIFY"
         exec_result = state.get("execution_result", {})
 
+        # RESUME安全性: modified_pathsが空でもstateから復元
+        if not modified_paths and exec_result.get("modified_files"):
+            modified_paths, backup_map = _restore_rollback_context(
+                state, workspace, output_dir,
+            )
+            if modified_paths:
+                print(f"[VERIFY] ロールバックコンテキストをstateから復元 ({len(modified_paths)}ファイル)")
+
         if args.dry_run:
             print("[VERIFY] dry-runモード: スキップ")
             state["verification_result"] = {"dry_run": True, "skipped": True}
         elif not exec_result.get("success", False):
-            # EXECUTE が失敗 → VERIFY もスキップ
             print("[VERIFY] EXECUTE失敗のためスキップ")
             state["verification_result"] = {"skipped": True, "reason": "execute_failed"}
         else:
-            # Verifier で再テスト
             print("[VERIFY] 検証コマンドを実行中...")
             verifier = Verifier(workspace)
             verify_result = verifier.verify(selected)
             state["verification_result"] = verify_result
             if verify_result["success"]:
                 print(f"[VERIFY] ✅ 検証成功 (exit_code={verify_result['exit_code']})")
-                # auto-commit / 警告
                 exec_git = state.get("execution_result", {}).get("git_available", False)
                 if getattr(args, "auto_commit", False) and exec_git:
                     try:
@@ -1299,7 +1458,7 @@ def _run_cycle_inner(
                             cwd=str(workspace),
                             capture_output=True, text=True, timeout=10,
                         )
-                        task_id = selected.get("id", "unknown") if selected else "unknown"
+                        task_id = selected.get("task_id", "unknown") if selected else "unknown"
                         subprocess.run(
                             ["git", "commit", "-m", f"[AGI-Kernel] auto-fix: {task_id}"],
                             cwd=str(workspace),
@@ -1314,7 +1473,6 @@ def _run_cycle_inner(
             else:
                 print(f"[VERIFY] ❌ 検証失敗 (exit_code={verify_result['exit_code']})")
                 print(f"[VERIFY] 出力: {verify_result['output'][:500]}")
-                # 検証失敗 → ロールバック（バックアップ復元）
                 if modified_paths:
                     print("[VERIFY] 変更をロールバックします...")
                     _rollback_with_backup(modified_paths, backup_map, workspace)
@@ -1421,6 +1579,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--workspace", type=str, default=str(_DEFAULT_WORKSPACE),
         help=f"ワークスペースルート（デフォルト: {_DEFAULT_WORKSPACE}）",
+    )
+    parser.add_argument(
+        "--llm-model", type=str, default=None, dest="llm_model",
+        help="LLMモデル名（デフォルト: gemini-2.5-flash / env AGI_KERNEL_LLM_MODEL）",
+    )
+    parser.add_argument(
+        "--llm-strong-model", type=str, default=None, dest="llm_strong_model",
+        help="強力LLMモデル（デフォルト: gemini-2.5-pro / env AGI_KERNEL_LLM_STRONG_MODEL）",
     )
     return parser
 
