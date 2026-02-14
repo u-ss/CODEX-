@@ -28,3 +28,26 @@ jobs:
 
       - name: Code Lib Tests
         run: python -m pytest .agent/workflows/code/lib/tests -q
+
+  # v0.6.0: CLI統合テスト + スキーマ固定テスト（必須ジョブ）
+  agi-kernel-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pytest
+
+      - name: AGI Kernel CLI統合テスト
+        run: |
+          python -m pytest tests/test_agi_kernel_state.py -k "CLIIntegration or ReportTokenUsageSchema" -v --tb=short
+
+      - name: AGI Kernel 全テスト
+        run: |
+          python -m pytest tests/test_agi_kernel_state.py -q --tb=short
