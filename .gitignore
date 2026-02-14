@@ -58,3 +58,5 @@ kdenlive/
 
 # --- Gemini brain ---
 .gemini/
+
+.env
